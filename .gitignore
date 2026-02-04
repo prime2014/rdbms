@@ -1,0 +1,20 @@
+# --- Compiled Binaries ---
+# Ignore the main executable (Windows and Linux)
+main
+main.exe
+*.o
+*.out
+
+# --- Database Data ---
+# We don't want to commit the actual database files
+# These should stay local to your machine
+data/*.db
+data/*.bin
+
+# --- IDE & System Files ---
+.vscode/
+.DS_Store
+tempCodeRunnerFile.cpp
+
+# --- Build Directories (If you use CMake later) ---
+build/
