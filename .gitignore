@@ -18,3 +18,4 @@ tempCodeRunnerFile.cpp
 
 # --- Build Directories (If you use CMake later) ---
 build/
+test_db.bin

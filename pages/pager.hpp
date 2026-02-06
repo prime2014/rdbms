@@ -5,6 +5,8 @@
 #include <string>
 #include <memory>
 #include "page.hpp"
+#include <cstdint>
+#include <cstring>
 
 
 
@@ -25,4 +27,17 @@ class Pager {
 };
 
 
+// Writes a 32-bit integer into a specific spot in the page
+inline void serialize_uint32(uint32_t value, char* destination) {
+    std::memcpy(destination, &value, sizeof(uint32_t));
+}
+
+// Reads a 32-bit integer from a specific spot in the page
+inline uint32_t deserialize_uint32(char* source) {
+    uint32_t value;
+    std::memcpy(&value, source, sizeof(uint32_t));
+    return value;
+}
+
 #endif
+
