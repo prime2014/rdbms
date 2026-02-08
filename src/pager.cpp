@@ -22,6 +22,8 @@ Pager::Pager(const std::string& filename) {
     file_stream.clear();
     file_stream.seekg(0, std::ios::beg);
 
+    // Initialize  page count
+    this->num_pages = file_length / PAGE_SIZE;
 
     // check if the file is "corrupt" (not a multiple of 4KB)
     if (file_length % PAGE_SIZE != 0) {
@@ -29,6 +31,10 @@ Pager::Pager(const std::string& filename) {
     };
 
     std::cout << "Opened " << filename << " with " << (file_length / PAGE_SIZE) << " pages " << std::endl;
+}
+
+uint32_t Pager::get_unused_page_number() {
+    return num_pages;
 }
 
 Pager::~Pager() {
@@ -54,6 +60,10 @@ std::unique_ptr<Page> Pager::read_page(uint32_t page_id) {
         // Scenario 2: Page Fault (Requetsed a page we haven't written yet)
         // We initialize the page with zeros (empty page)
         std::memset(page->data, 0, PAGE_SIZE);
+
+        if (page_id >= num_pages) {
+            num_pages = page_id + 1;
+        }
         std::cout << "Page Fault: Initialized new page " << page_id << " in memory." << std::endl;
     }
 

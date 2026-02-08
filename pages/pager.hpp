@@ -14,11 +14,15 @@ class Pager {
     private:
         std::fstream file_stream;
         uint32_t file_length;
+        uint32_t num_pages;
     
     public:
         Pager(const std::string& filename);
         ~Pager();
 
+        uint32_t get_num_pages() const { return num_pages; }
+
+        uint32_t get_unused_page_number();
         // Returns a pointer to a page loaded from disk
         std::unique_ptr<Page> read_page(uint32_t page_id);
 
