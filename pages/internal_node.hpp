@@ -22,12 +22,80 @@ public:
         return get_right_child();
     }
 
+    bool is_root() const {
+        return (uint8_t) *(page->data + IS_ROOT_OFFSET) == 1;
+    };
+
     // --- Memory Accessors using 8-byte steps ---
 
     uint32_t get_child(uint32_t child_idx) {
         // Starts at 20. Each cell is [ChildID(4b)][Key(4b)]
         char* addr = page->data + INTERNAL_NODE_CELLS_START + (child_idx * 8);
         return deserialize_uint32(addr);
+    }
+
+    SplitResult split_and_insert(SplitResult result, Pager& pager) {
+        char* cell_start = this->page->data + INTERNAL_NODE_CELLS_START;
+        uint32_t key_count = this->get_key_count();
+
+        char virtual_buffer[PAGE_SIZE] = {0};
+        std::memcpy(virtual_buffer, cell_start, key_count * 8);
+
+        uint32_t insertion_index = 0;
+        while(insertion_index < key_count) {
+            // Use your existing get_key logic but on the buffer
+            uint32_t existing_key = *(uint32_t*) (virtual_buffer + (insertion_index * 8) + 4);
+            if (existing_key > result.split_key) break;
+            insertion_index++;
+        }
+
+        uint32_t cells_to_move = key_count - insertion_index;
+        std::memmove(
+            virtual_buffer + ((insertion_index + 1) * 8),
+            virtual_buffer + (insertion_index * 8),
+            cells_to_move * 8
+        );
+
+        *(uint32_t*)(virtual_buffer + (insertion_index * 8)) = result.new_page_id;
+        *(uint32_t*)(virtual_buffer + (insertion_index * 8) + 4) = result.split_key;
+
+        uint32_t total_keys = key_count + 1;
+        uint32_t midpoint = total_keys / 2; 
+
+        uint32_t sibling_page_id = pager.get_unused_page_number();
+        
+        auto sibling_page_ptr = pager.read_page(sibling_page_id);
+        InternalNode sibling_node(sibling_page_ptr.get(), sibling_page_id);
+        
+        sibling_node.set_node_type();
+        sibling_node.set_key_count(0);
+
+        SplitResult promotion;
+        promotion.split_key = *(uint32_t*)(virtual_buffer + (midpoint * 8) + 4);
+        promotion.new_page_id = sibling_page_id;
+
+        // FIX 3: Save the OLD right child before overwriting it
+        uint32_t old_right_child = this->get_right_child();
+
+        uint32_t new_left_right_child = *(uint32_t*)(virtual_buffer + (midpoint * 8));
+        
+        this->set_key_count(midpoint);
+        this->set_right_child(new_left_right_child);
+        std::memcpy(cell_start, virtual_buffer, midpoint * 8);
+
+        uint32_t right_key_count = total_keys - midpoint - 1;
+        sibling_node.set_key_count(right_key_count);
+        
+        // The sibling inherits the original node's old Right Child
+        sibling_node.set_right_child(old_right_child);
+
+        char* sibling_cell_start = sibling_node.page->data + INTERNAL_NODE_CELLS_START;
+        std::memcpy(sibling_cell_start, virtual_buffer + ((midpoint + 1) * 8), right_key_count * 8);
+
+        // FIX 4: Write the new sibling page back to the pager
+        pager.write_page(sibling_page_id, *sibling_page_ptr);
+
+        return promotion;
     }
 
     void set_child(uint32_t child_idx, uint32_t child_id) {
@@ -55,5 +123,39 @@ public:
 
     void set_right_child(uint32_t id) {
         serialize_uint32(id, page->data + RIGHT_CHILD_OFFSET);
+    }
+
+
+    void insert_child(uint32_t split_key, uint32_t new_child_page_id) {
+        uint32_t num_keys = get_key_count();
+        uint32_t target_idx = num_keys;
+
+        // 1. Find the correct slot for the new divider key
+        // We want to keep keys in ascending order
+        for(uint32_t i = 0; i < num_keys; i++) {
+            if(split_key < get_key(i)) {
+                target_idx = i;
+                break;
+            }
+        }
+
+        // 2. Shift existing entires to the right by 8 bytes
+        // Each entry is: [4b Child ID][4b Key]
+        char* src = page->data + INTERNAL_NODE_CELLS_START + (target_idx * 8);
+        char* dest = src + 8;
+        uint32_t bytes_to_move = (num_keys - target_idx) * 8;
+
+        if (num_keys > target_idx) {
+            std::memmove(dest, src, bytes_to_move);
+        }
+
+        // 3. Insert the new data
+        // The key from the SplitResult becomes the divider
+        // The new_page_id becomes the child pointer for that divider
+        set_child(target_idx, new_child_page_id);
+        set_key(target_idx, split_key);
+
+        // 4. Increment the count
+        set_key_count(num_keys + 1);
     }
 };

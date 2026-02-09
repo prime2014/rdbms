@@ -78,6 +78,8 @@ class Table {
             
             pager->write_page(0, *root_handle);
         }
+
+        void update_parent(uint32_t parent_id, SplitResult result);
     
     private:
         // Navigation logic: Start at root, follow pointer down to the leaf
