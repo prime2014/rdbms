@@ -83,6 +83,8 @@ void Pager::write_page(uint32_t page_id, const Page& page) {
 
     if (current_end > file_length) {
         file_length = current_end;
+
+        num_pages = file_length / PAGE_SIZE;
     }
 }
 

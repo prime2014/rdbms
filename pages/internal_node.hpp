@@ -4,6 +4,12 @@
 // We define this to ensure we skip the Right Child pointer and Table Count
 const uint32_t INTERNAL_NODE_CELLS_START = 20; 
 
+
+enum NodeType {
+    NODE_INTERNAL = 0,
+    NODE_LEAF = 1
+};
+
 class InternalNode : public Node {
 public:
     InternalNode(Page *p, uint32_t id) : Node(p, id) {};
@@ -22,6 +28,15 @@ public:
         return get_right_child();
     }
 
+    Page* get_page() {
+        return this->page;
+    }
+
+
+    uint32_t get_parent() {
+        return *(uint32_t*)(page->data + PARENT_POINTER_OFFSET);
+    };
+
     bool is_root() const {
         return (uint8_t) *(page->data + IS_ROOT_OFFSET) == 1;
     };
@@ -32,6 +47,11 @@ public:
         // Starts at 20. Each cell is [ChildID(4b)][Key(4b)]
         char* addr = page->data + INTERNAL_NODE_CELLS_START + (child_idx * 8);
         return deserialize_uint32(addr);
+    }
+
+    void set_node_type(NodeType type) {
+        uint8_t value = static_cast<uint8_t>(type);
+        *(page->data + 0) = value; 
     }
 
     SplitResult split_and_insert(SplitResult result, Pager& pager) {
@@ -47,6 +67,7 @@ public:
             uint32_t existing_key = *(uint32_t*) (virtual_buffer + (insertion_index * 8) + 4);
             if (existing_key > result.split_key) break;
             insertion_index++;
+
         }
 
         uint32_t cells_to_move = key_count - insertion_index;
@@ -67,7 +88,7 @@ public:
         auto sibling_page_ptr = pager.read_page(sibling_page_id);
         InternalNode sibling_node(sibling_page_ptr.get(), sibling_page_id);
         
-        sibling_node.set_node_type();
+        sibling_node.set_node_type(NODE_INTERNAL);
         sibling_node.set_key_count(0);
 
         SplitResult promotion;
@@ -94,9 +115,11 @@ public:
 
         // FIX 4: Write the new sibling page back to the pager
         pager.write_page(sibling_page_id, *sibling_page_ptr);
-
+        pager.write_page(this->page_id, *(this->page));
         return promotion;
     }
+
+
 
     void set_child(uint32_t child_idx, uint32_t child_id) {
         char* addr = page->data + INTERNAL_NODE_CELLS_START + (child_idx * 8);
@@ -123,6 +146,12 @@ public:
 
     void set_right_child(uint32_t id) {
         serialize_uint32(id, page->data + RIGHT_CHILD_OFFSET);
+    }
+
+
+    void set_parent(uint32_t new_root_id) {
+        uint32_t* addr = (uint32_t*)(page->data + PARENT_POINTER_OFFSET);
+        *addr = new_root_id;
     }
 
 

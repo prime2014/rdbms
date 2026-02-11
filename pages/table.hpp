@@ -36,6 +36,8 @@ class Table {
             }
         }
 
+        void process_internal_root_split(InternalNode parent, SplitResult internal_split);
+
         // The high-level interface for the Database class
         void insert(uint32_t key, const char* value) {
             // 1. Find the correct leaf where this key belongs
@@ -67,7 +69,7 @@ class Table {
             
             // Format Page 0 as an Internal Node
             InternalNode root(root_handle.get(), 0);
-            root.set_node_type(0); // Internal
+            root.set_node_type(NODE_INTERNAL); // Internal
             root.set_is_root(1);
             root.set_key_count(1);
             
