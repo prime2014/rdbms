@@ -27,6 +27,7 @@ class Table {
                 root_node.set_is_root(1);
                 root_node.set_key_count(0);
                 root_node.set_next_page(0); // No sibling yet
+
                 
                 // Initialize the global row count to 0
                 serialize_uint32(0, root_handle->data + TABLE_TOTAL_COUNT_OFFSET);
@@ -43,8 +44,14 @@ class Table {
             // 1. Find the correct leaf where this key belongs
             uint32_t leaf_id = find_leaf(root_page_id, key);
 
-            // 2. Load that leaf
-            auto page_handle = pager->read_page(leaf_id);
+
+            // We check if this is the last page to leverage the pin
+            auto page_handle = pager->get_page(leaf_id);
+
+            if (leaf_id == pager->get_num_pages() - 1) {
+                pager->pin_last_page(leaf_id, page_handle);
+            }
+
             LeafNode leaf(page_handle.get(), leaf_id);
 
             // 3. Handle the insert/split logic

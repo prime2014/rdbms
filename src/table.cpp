@@ -26,38 +26,42 @@ void Table::update_parent(uint32_t parent_id, SplitResult result) {
 }
 
 
-void Table::process_internal_root_split(InternalNode old_root, SplitResult internal_split) {
-    uint32_t new_root_id = pager->get_unused_page_number();
-    auto new_root_handle =  pager->read_page(new_root_id);
 
-    InternalNode new_root(new_root_handle.get(), new_root_id);
+void Table::process_internal_root_split(InternalNode old_root, SplitResult internal_split) {
+    // 1. Move the OLD data out of Page 0 into a brand new page
+    uint32_t left_child_id = pager->get_unused_page_number();
+    auto left_child_handle = pager->read_page(left_child_id);
     
-    // initialize the root
+    // Copy the contents of Page 0 to the new page
+    std::memcpy(left_child_handle->data, old_root.get_page()->data, PAGE_SIZE);
+    
+    InternalNode left_child(left_child_handle.get(), left_child_id);
+    left_child.set_is_root(false);
+    left_child.set_parent(0); // It now points back to Page 0
+
+    // 2. Re-initialize Page 0 as the NEW Root
+    // We don't change root_page_id; it stays 0.
+    auto root_handle = old_root.get_page(); // This IS Page 0
+    
+    // Clear node-specific header bits (but be careful of byte 4-7 if you store row count there!)
+    InternalNode new_root(root_handle, 0);
     new_root.set_node_type(NODE_INTERNAL);
     new_root.set_is_root(true);
     new_root.set_key_count(1);
 
-
-    // link the children
-    new_root.set_child(0, old_root.get_page_id());
+    // 3. Link the new children
+    new_root.set_child(0, left_child_id);       // The old data we just moved
     new_root.set_key(0, internal_split.split_key);
     new_root.set_right_child(internal_split.new_page_id);
 
-    // 4. Update the old root's metadata
-    old_root.set_is_root(false);
-    old_root.set_parent(new_root_id);
-
-    // 5. Update the Sibling's metadata (It needs to know who its new father is)
+    // 4. Update Sibling's parent to Page 0
     auto sibling_handle = pager->read_page(internal_split.new_page_id);
     InternalNode sibling(sibling_handle.get(), internal_split.new_page_id);
-    sibling.set_parent(new_root_id);
+    sibling.set_parent(0);
 
-    // 6. Persist everything
-    pager->write_page(new_root_id, *new_root_handle);
-    pager->write_page(old_root.get_page_id(), *(old_root.get_page()));
+    // 5. Persist
+    pager->write_page(left_child_id, *left_child_handle);
     pager->write_page(internal_split.new_page_id, *sibling_handle);
-
-    // 7. Update the table pointer
-    this->root_page_id = new_root_id;
+    pager->write_page(0, *root_handle);
 
 }
