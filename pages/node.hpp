@@ -23,6 +23,7 @@ const uint32_t COMMON_HEADER_SIZE = 20;       // Total header length
 const uint32_t INTERNAL_NODE_CELLS_START = 20; 
 const uint32_t LEAF_NODE_CELLS_START = 20;
 
+const uint32_t INTERNAL_NODE_MAX_CELLS = (PAGE_SIZE - COMMON_HEADER_SIZE) / 8;
 
 struct SplitResult {
     uint32_t split_key;
@@ -38,16 +39,30 @@ class Node {
         public:
             Node(Page* p, uint32_t id): page(p), page_id(id) {};
 
+            Page* get_page() { return page; }
+
             uint32_t get_page_id() const {
                 return page_id;
             };
 
+            void set_parent(uint32_t parent_id) {
+                serialize_uint32(parent_id, page->data + PARENT_POINTER_OFFSET);
+            }
+
+            uint32_t get_parent() {
+                return deserialize_uint32(page->data + PARENT_POINTER_OFFSET);
+            }
+
+            // Every node needs to know if it's the root
+            void set_is_root(bool is_root) {
+                uint8_t value = is_root ? 1 : 0;
+                *(page->data + IS_ROOT_OFFSET) = value;
+            }
+
             void set_node_type(uint8_t type) { page->data[NODE_TYPE_OFFSET] = type; }
             uint8_t get_node_type() { return page->data[NODE_TYPE_OFFSET]; }
 
-            void set_is_root(uint8_t is_root) {
-                page->data[IS_ROOT_OFFSET] = is_root;
-            }
+            
 
             void set_key_count(uint32_t count) {
                 serialize_uint32(count, page->data + KEY_COUNT_OFFSET);

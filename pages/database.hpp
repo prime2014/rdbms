@@ -6,6 +6,7 @@
 #include <memory>
 #include "table.hpp"
 
+
 class Database {
     private:
         std::string db_directory;
