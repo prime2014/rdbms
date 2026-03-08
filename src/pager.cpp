@@ -1,195 +1,253 @@
 #include "../pages/pager.hpp"
 #include <iostream>
 #include <cstring>
-#include <set>
 #include <fcntl.h>
 #include <unistd.h>
-#include <sys/uio.h>
+#include <sys/stat.h>
 #include <coroutine>
-#include <map>
+#include <liburing.h>
+#include <stdexcept>
 
-Pager::Pager(const std::string& filename) {
-    file_stream.open(filename, std::ios::in | std::ios::out | std::ios::binary);
-
-    if (!file_stream.is_open()) {
-        // if file does not exist, create it by opening in "out" mode only first
-        file_stream.open(filename, std::ios::out | std::ios::binary);
-        file_stream.close();
-
-        // Re-open with full permissions
-        file_stream.open(filename, std::ios::in | std::ios::out | std::ios::binary);
+Pager::Pager(const std::string& filename, bool memory_only) : memory_only_(memory_only) {
+    if (memory_only_) {
+        this->fd = -1;
+        this->file_length = 0;
+        this->num_pages = 0;
+        return;
     }
 
+    // Initialize io_uring
+    if (io_uring_queue_init(256, &ring, 0) < 0) {
+        throw std::runtime_error("Failed to initialize io_uring");
+    }
 
-    // Determine file length
-    file_stream.seekg(0, std::ios::end);
-    file_length = file_stream.tellg();
-    file_stream.clear();
-    file_stream.seekg(0, std::ios::beg);
+    // Open file using low-level O_RDWR for io_uring compatibility
+    this->fd = open(filename.c_str(), O_RDWR | O_CREAT, 0644);
+    if (this->fd < 0) {
+        throw std::runtime_error("Could not open file: " + filename);
+    }
 
-    // Initialize  page count
-    this->num_pages = file_length / PAGE_SIZE;
+    // Determine file length and page count
+    struct stat st;
+    if (fstat(this->fd, &st) == 0) {
+        this->file_length = st.st_size;
+        this->num_pages = this->file_length / PAGE_SIZE;
+    }
 
-    // check if the file is "corrupt" (not a multiple of 4KB)
-    if (file_length % PAGE_SIZE != 0) {
-        std::cerr << "Warning: DB file is not a multiple pf PAGE_SIZE!" << std::endl;
-    };
+    if (this->file_length % PAGE_SIZE != 0) {
+        std::cerr << "Warning: DB file size is not a multiple of PAGE_SIZE!" << std::endl;
+    }
 
-    std::cout << "Opened " << filename << " with " << (file_length / PAGE_SIZE) << " pages " << std::endl;
-}
-
-uint32_t Pager::get_unused_page_number() {
-    return num_pages;
+    std::cout << "Opened " << filename << " [FD: " << fd << "] with " << num_pages << " pages." << std::endl;
 }
 
 Pager::~Pager() {
-    if (file_stream.is_open()) {
-        file_stream.close();
+    if (memory_only_) return;
+    io_uring_queue_exit(&ring);
+    if (this->fd >= 0) close(this->fd);
+}
+
+// --- Async I/O Core ---
+
+void Pager::process_completions() {
+    if (memory_only_) {
+        std::vector<std::coroutine_handle<>> batch;
+        batch.swap(memory_pending_resumes_);
+        for (auto h : batch) {
+            if (h && !h.done()) h.resume();
+        }
+        return;
+    }
+
+    struct io_uring_cqe* cqe;
+    int completions_found = 0;
+
+    // Non-blocking peek at the Completion Queue
+    while (io_uring_peek_cqe(&ring, &cqe) == 0) {
+        completions_found++;
+        
+        // Retrieve the coroutine handle from user_data
+        auto h = std::coroutine_handle<>::from_address(io_uring_cqe_get_data(cqe));
+
+        if (cqe->res < 0) {
+            std::cerr << "I/O Error: " << std::strerror(-cqe->res) << std::endl;
+        }
+
+        io_uring_cqe_seen(&ring, cqe);
+
+        // Resume the suspended B+ Tree task
+        if (h && !h.done()) {
+            h.resume();
+        }
+    }
+
+    if (completions_found > 0) {
+        std::cout << "Pager: Processed " << completions_found << " I/O completions." << std::endl;
     }
 }
 
-
-std::unique_ptr<Page> Pager::read_page(uint32_t page_id) {
-    auto page = std::make_unique<Page>();
-    uint32_t offset = page_id * PAGE_SIZE;
-
-    // Always clear flags (EOF/Fail) before a new operation
-    file_stream.clear();
-
-    if (offset < file_length) {
-        file_stream.seekg(offset, std::ios::beg);
-        file_stream.read(page->data, PAGE_SIZE);
-
-        std::streamsize bytes_read = file_stream.gcount();
-        if (bytes_read < PAGE_SIZE) {
-            // Fill the rest of the buffer with zeros to prevent garbage data
-            std::memset(page->data + bytes_read, 0, PAGE_SIZE - bytes_read);
-        }
-    } else {
-        // Scenario 2: New page initialization
-        std::memset(page->data, 0, PAGE_SIZE);
-
-        if (page_id >= num_pages) {
-            num_pages = page_id + 1;
-        }
+void Pager::schedule_write(uint32_t page_id, std::coroutine_handle<> h) {
+    if (memory_only_) {
+        clear_dirty(page_id);
+        memory_pending_resumes_.push_back(h);
+        return;
     }
 
-    return page;
+    struct io_uring_sqe* sqe = io_uring_get_sqe(&ring);
+    if (!sqe) {
+        io_uring_submit(&ring);
+        sqe = io_uring_get_sqe(&ring);
+    }
+
+    void* buffer = page_cache[page_id]->data;
+    off_t offset = (off_t)page_id * PAGE_SIZE;
+
+    io_uring_prep_write(sqe, fd, buffer, PAGE_SIZE, offset);
+    io_uring_sqe_set_data(sqe, h.address());
+    
+    clear_dirty(page_id);
 }
 
+void Pager::schedule_async_load(uint32_t page_id, std::coroutine_handle<> h) {
+    if (memory_only_) {
+        if (page_cache.find(page_id) == page_cache.end()) {
+            page_cache[page_id] = std::make_shared<Page>();
+        }
+        memory_pending_resumes_.push_back(h);
+        return;
+    }
+
+    struct io_uring_sqe* sqe = io_uring_get_sqe(&ring);
+    if (!sqe) {
+        io_uring_submit(&ring);
+        sqe = io_uring_get_sqe(&ring);
+    }
+
+    auto page = std::make_shared<Page>();
+    page_cache[page_id] = page;
+
+    io_uring_prep_read(sqe, fd, page->data, PAGE_SIZE, (off_t)page_id * PAGE_SIZE);
+    io_uring_sqe_set_data(sqe, h.address());
+}
+
+// --- Synchronous Fallbacks & Metadata ---
 
 void Pager::write_page(uint32_t page_id, const Page& page) {
-    uint32_t offset = page_id * PAGE_SIZE;
-
-    file_stream.seekp(offset, std::ios::beg);
-    file_stream.write(page.data, PAGE_SIZE);
-    file_stream.flush();
-
-    uint32_t current_end = offset + PAGE_SIZE;
-
-    if (current_end > file_length) {
-        file_length = current_end;
-
+    off_t offset = (off_t)page_id * PAGE_SIZE;
+    if (pwrite(this->fd, page.data, PAGE_SIZE, offset) == -1) {
+        throw std::runtime_error("Synchronous write failed");
+    }
+    
+    if (offset + PAGE_SIZE > file_length) {
+        file_length = offset + PAGE_SIZE;
         num_pages = file_length / PAGE_SIZE;
     }
 }
 
+std::unique_ptr<Page> Pager::read_page(uint32_t page_id) {
+    auto page = std::make_shared<Page>();
+    ssize_t bytes = pread(this->fd, page->data, PAGE_SIZE, (off_t)page_id * PAGE_SIZE);
+    
+    if (bytes < 0) throw std::runtime_error("Sync read failed");
+    if (bytes < PAGE_SIZE) std::memset(page->data + bytes, 0, PAGE_SIZE - bytes);
 
+    page_cache[page_id] = page;
+    return std::make_unique<Page>(*page);
+}
 
-PageAwaiter Pager::flush_page_async(uint32_t page_id) {
-    mark_as_dirty(page_id);
+// --- Awaiter Factories ---
 
+FlushAwaiter Pager::flush_page_async(uint32_t page_id) {
+    return FlushAwaiter{this, page_id};
+}
+
+PageAwaiter Pager::get_page_async(uint32_t page_id) {
     return PageAwaiter{this, page_id};
 }
 
+// --- Bitmap & Cache Helpers ---
 
 void Pager::mark_as_dirty(uint32_t page_id) {
-    
-    // Find which byte holds this page's bit
-    uint32_t byte_index = page_id / 8;
-
-    // Find which bit inside that byte
-    uint8_t bit_index = page_id % 8;
-
-    // Ensure the bitmap is large enough
-    if (byte_index >= dirty_bitmap.size()) {
-        dirty_bitmap.resize(byte_index + 1, 0);   
-    }
-
-    // Set the bit to 1 using bitwise OR
-    dirty_bitmap[byte_index] |= (1 << bit_index);
+    uint32_t idx = page_id / 8;
+    if (idx >= dirty_bitmap.size()) dirty_bitmap.resize(idx + 1, 0);
+    dirty_bitmap[idx] |= (1 << (page_id % 8));
 }
-
-
-bool Pager::is_dirty(uint32_t page_id) const {
-    uint32_t byte_index = page_id / 8;
-    uint8_t bit_index = page_id % 8;
-    if (byte_index >= dirty_bitmap.size()) return false;
-    
-    return (dirty_bitmap[byte_index] & (1 << bit_index)) != 0;
-}
-
 
 void Pager::clear_dirty(uint32_t page_id) {
-    uint32_t byte_index = page_id / 8;
-    uint8_t bit_index = page_id % 8;
-    
-    // Set the bit back to 0 using a bitwise AND with a NOT mask
-    dirty_bitmap[byte_index] &= ~(1 << bit_index);
+    uint32_t idx = page_id / 8;
+    if (idx < dirty_bitmap.size()) dirty_bitmap[idx] &= ~(1 << (page_id % 8));
+}
+
+bool Pager::is_dirty(uint32_t page_id) const {
+    uint32_t idx = page_id / 8;
+    if (idx >= dirty_bitmap.size()) return false;
+    return (dirty_bitmap[idx] & (1 << (page_id % 8))) != 0;
+}
+
+bool Pager::is_in_memory(uint32_t page_id) const {
+    return page_cache.find(page_id) != page_cache.end();
+}
+
+std::shared_ptr<Page> Pager::get_page_from_cache(uint32_t page_id) {
+    return page_cache.at(page_id);
+}
+
+bool Pager::is_ring_idle() {
+    return memory_only_ ? true : (io_uring_sq_ready(&ring) == 0);
+}
+
+uint32_t Pager::get_unused_page_number() { return num_pages; }
+uint32_t Pager::get_num_pages() { return num_pages; }
+int Pager::get_fd() { return fd; }
+
+
+// 1. Modified submit_write (now just queues)
+void Pager::submit_write(uint32_t page_id, std::coroutine_handle<> h) {
+    if (memory_only_) { /* ... */ return; }
+
+    struct io_uring_sqe* sqe = io_uring_get_sqe(&ring);
+    if (!sqe) {
+        // If SQ is full, we are forced to submit to make room
+        io_uring_submit(&ring);
+        sqe = io_uring_get_sqe(&ring);
+    }
+
+    void* buffer = page_cache[page_id]->data;
+    io_uring_prep_write(sqe, fd, buffer, PAGE_SIZE, (off_t)page_id * PAGE_SIZE);
+    io_uring_sqe_set_data(sqe, h.address());
+    clear_dirty(page_id);
+    // REMOVED io_uring_submit here
+}
+
+// 2. New submit_all method
+void Pager::submit_all() {
+    io_uring_submit(&ring);
 }
 
 
-void Pager::schedule_write(uint32_t page_id, std::coroutine_handle<> h) {
-    // 1. Ensure the page is actually in cache before we try to write it
-    if (!is_in_memory(page_id)) {
-        throw std::runtime_error("Cannot schedule write for page not in memory");
+// 1. Implementation for shutdown_gracefully()
+void Pager::shutdown_gracefully() {
+    if (memory_only_) return;
+    // Flush all dirty pages before closing
+    for (uint32_t i = 0; i < num_pages; ++i) {
+        if (is_dirty(i)) {
+            write_page(i, *page_cache[i]);
+        }
     }
-
-    
-    pending_io[page_id] = h;
-
-    // 3. Mark it as dirty if not already (safety check)
-    mark_as_dirty(page_id);
-
-    // Note: We do NOT resume 'h' here. 
-    // 'h' will stay frozen until the disk (or TCL) finishes the write.
+    io_uring_submit(&ring);
+    std::cout << "Pager: All dirty pages flushed." << std::endl;
 }
 
-
-void Pager::process_pending_writes() {
-    if (pending_io.empty()) return;
-
-    // Use a map to ensure we process pages in file-offset order
-    std::map<uint32_t, std::coroutine_handle<>> sorted_io(pending_io.begin(), pending_io.end());
-    pending_io.clear();
-
-    auto it = sorted_io.begin();
-    while (it != sorted_io.end()) {
-        std::vector<struct iovec> clump_iov;
-        std::vector<std::coroutine_handle<>> clump_handles;
-        
-        uint32_t start_id = it->first;
-        uint32_t next_expected = start_id;
-
-        // GATHER: Build a clump of contiguous pages
-        while (it != sorted_io.end() && it->first == next_expected) {
-            clump_iov.push_back({ page_cache[it->first]->data, (size_t)PAGE_SIZE });
-            clump_handles.push_back(it->second);
-            
-            clear_dirty(it->first);
-            next_expected++;
-            it++;
-        }
-
-        // GATHER: Write this specific contiguous clump
-        if (!clump_iov.empty()) {
-            off_t offset = (off_t)start_id * PAGE_SIZE;
-            pwritev(this->fd, clump_iov.data(), clump_iov.size(), offset);
-        }
-
-        // RESUME: Wake up the coroutines for this clump
-        for (auto h : clump_handles) {
-            if (h && !h.done()) h.resume();
-        }
+// 2. Implementation for async_load_from_disk()
+void Pager::async_load_from_disk(uint32_t page_id) {
+    if (page_cache.find(page_id) == page_cache.end()) {
+        page_cache[page_id] = std::make_shared<Page>();
     }
+
+    struct io_uring_sqe* sqe = io_uring_get_sqe(&ring);
+    if (!sqe) return; 
+
+    io_uring_prep_read(sqe, fd, page_cache[page_id]->data, PAGE_SIZE, (off_t)page_id * PAGE_SIZE);
+    io_uring_sqe_set_data(sqe, (void*)(uintptr_t)page_id);
+    io_uring_submit(&ring);
 }

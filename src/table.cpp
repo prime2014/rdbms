@@ -1,8 +1,10 @@
 #include <cstdint>
 #include <iostream>
 #include <memory>
-#include "pages/table.hpp"
+#include "../pages/table.hpp"
 #include "../pages/cursor.hpp"
+#include "../pages/internal_node.hpp"
+#include "../pages/cursor_task.hpp"
 
 
 // ────────────────────────────────────────────────
@@ -21,107 +23,63 @@
 #endif
 
 
-void Table::update_parent(uint32_t parent_id, SplitResult result) {
-    auto parent_handle = pager->read_page(parent_id);
-    InternalNode parent(parent_handle.get(), parent_id);
 
-    // Check if the internal node has room for one or more [ChildID + Key]
-    // Max cells for internal; (4096-20-4 for right child) / 8 = 509 cells
-    if(parent.get_key_count() < 500) {
-        parent.insert_child(result.split_key, result.new_page_id);
-        pager->write_page(parent_id, *parent_handle);
-    } else {
-        SplitResult internal_split = parent.split_and_insert(result, *pager);
-
-        // 2. If this  was the root, we need a new root
-        if (parent.is_root()) {
-            process_internal_root_split(parent, internal_split);
-        } else {
-            update_parent(parent.get_parent(), internal_split);
-        }
-    }
-
-}
-
-
-void Table::process_internal_root_split(InternalNode old_root, SplitResult internal_split) {
-    uint32_t left_child_id = pager->get_unused_page_number();
-    auto left_child_handle = pager->read_page(left_child_id);
-    
-    std::memcpy(left_child_handle->data, old_root.get_page()->data, PAGE_SIZE);
-
-    InternalNode left_child(left_child_handle.get(), left_child_id);
-    left_child.set_is_root(false);
-    left_child.set_parent(0); // Page 0 is the root
-
-    // Update parent pointers of ALL children now owned by left_child
-    for (uint32_t i = 0; i < left_child.get_key_count(); i++) {
-        uint32_t child_page_id = left_child.get_child(i);
-        auto child_handle = pager->get_page(child_page_id);
-        serialize_uint32(left_child_id, child_handle->data + PARENT_POINTER_OFFSET);
-        pager->write_page(child_page_id, *child_handle);
-    }
-    
-    // Fix: Use the Anchor accessor instead of get_right_child
-    uint32_t anchor_child = left_child.get_leftmost_child();
-    auto anchor_handle = pager->get_page(anchor_child);
-    serialize_uint32(left_child_id, anchor_handle->data + PARENT_POINTER_OFFSET);
-    pager->write_page(anchor_child, *anchor_handle);
-
-    // 2. Re-initialize Page 0 as the NEW Root
-    auto root_handle = old_root.get_page(); 
-    InternalNode new_root(root_handle, 0);
-    
-    // We use our clean initialization logic here
-    new_root.set_node_type(NODE_INTERNAL);
-    new_root.set_is_root(true);
-    new_root.set_key_count(1);
-    
-    // 3. Link the new children using cell 0
-    new_root.set_leftmost_child(left_child_id);      // Left side of split_key
-    new_root.set_key(0, internal_split.split_key);
-    new_root.set_child(0, internal_split.new_page_id); // Right side of split_key
-
-    // 4. Update Sibling's parent to Page 0
-    auto sibling_handle = pager->read_page(internal_split.new_page_id);
-    Node sibling(sibling_handle.get(), internal_split.new_page_id);
-    sibling.set_parent(0);
-
-    // 5. Persist
-    pager->write_page(left_child_id, *left_child_handle);
-    pager->write_page(internal_split.new_page_id, *sibling_handle);
-    pager->write_page(0, *root_handle);
-}
-
-
-void Table::scan_records(uint32_t start_page_id) {
+// Change return type to a Task that can be awaited
+VoidTask Table::scan_records_async(uint32_t start_page_id) {
     uint32_t current_id = start_page_id;
 
     while (current_id != 0) {
-        auto handle = pager->get_page(current_id);
+        // 1. Await the page fetch. This yields the coroutine if not in cache.
+        auto page_handle = co_await pager->get_page_async(current_id);
+        LeafNode node(page_handle.get(), current_id);
 
-        LeafNode node(handle.get(), current_id);
-
-        // --- THE CPU HINT STEP ---
+        // 2. Lookahead: Trigger async load for the NEXT page
         uint32_t next_id = node.get_next_page();
-        if (next_id != 0) {
-            if (pager->is_in_memory(next_id)) {
-                // HINT 1: It's in RAM. Tell CPU to pull it into L1 Cache.
-                PREFETCH_READ(pager->get_page_ptr(next_id));
-            } else {
-                // HINT 2: It's on DISK. Tell the OS to start an Asynchronous I/O read.
-                // This is the "Software version" of a CPU prefetch for Disk.
-                pager->async_load_from_disk(next_id); 
-            }
+        if (next_id != 0 && !pager->is_in_memory(next_id)) {
+            // Non-awaiting call to start the disk read in the background
+            pager->async_load_from_disk(next_id); 
         }
 
-        // Now process the current page. While the CPU does this math,
-        // the NEXT page is already flying through the wires toward the CPU.
-        process_records(node); 
+        // 3. Process the current node
+        co_await process_records_async(current_id); 
         
         current_id = next_id;
     }
 }
+
+Pager* Table::get_pager() {
+    return this->pager.get();
+}
+
+PageTask Table::insert(uint32_t key, const char* value) {
+            // 1. Find leaf asynchronously
+    uint32_t leaf_id;
+    std::shared_ptr<Page> leaf_page = co_await find_leaf_async(root_page_id, key, leaf_id);
+
+    // 2. Handle pinning (Note: if you are using async, pinning becomes less relevant
+    //    because the cache handles page residency)
+    LeafNode leaf(leaf_page.get(), leaf_id);
+    uint32_t parent_id = leaf.get_parent();
+
+    // 3. Insert or Split
+    if (leaf.get_key_count() >= LEAF_NODE_MAX_CELLS) {
+        SplitResult result = co_await leaf.split_and_insert_async(key, value, *pager);
+        if (parent_id == 0) { 
+            co_await create_new_root_async(leaf_id, result.split_key, result.new_page_id);
+        } else {
+            co_await update_parent_async(parent_id, result);
+        }
+    } else {
+        leaf.insert(key, value, *pager);
+        // Ensure the change is flushed to disk
+        co_await pager->flush_page_async(leaf_id);
+    }
+
+            // 4. Update the global count
+    co_await increment_total_count_async();
+            
+    co_return leaf_page;
+};
 
 
 VoidTask Table::increment_total_count_async() {
@@ -142,32 +100,82 @@ VoidTask Table::increment_total_count_async() {
 }
 
 
-void Table::process_records(uint32_t start_leaf_id) {
+VoidTask Table::process_records_async(uint32_t start_leaf_id) {
     uint32_t current_id = start_leaf_id;
 
     while (current_id != 0) {
-        // 1. Get the page from the pager
-        auto page_handle = pager->get_page(current_id);
+        // 1. Asynchronously fetch the page. 
+        // The event loop is free to handle other inserts/flushes while we wait.
+        std::shared_ptr<Page> page_handle = co_await pager->get_page_async(current_id);
         LeafNode node(page_handle.get(), current_id);
 
         uint32_t num_cells = node.get_num_cells();
         
-        // 2. Process all records in the CURRENT leaf
+        // 2. Process records (Synchronous CPU work)
         for (uint32_t i = 0; i < num_cells; i++) {
             uint32_t key = node.get_key(i);
             char* value = node.get_value(i);
-            
-            // For testing: output the key and the 32-byte string
             std::cout << "ID: " << key << " | Data: " << value << std::endl;
         }
 
-        // 3. Follow the "Trail" to the next leaf
+        // 3. Move to the next page
         current_id = node.get_next_page(); 
+    }
+    
+    co_return;
+};
+
+uint32_t Table::find_leaf(uint32_t page_id, uint32_t key) {
+    auto page_handle = pager->read_page(page_id);
+
+    // if it is a leaf, we found our target
+    if (page_handle->data[NODE_TYPE_OFFSET] == 1) {
+        return page_id;
+    }
+
+    // if it's internal, find which child to follow
+    InternalNode internal(page_handle.get(), page_id);
+    uint32_t child_id = internal.get_child_for_key(key);
+    return find_leaf(child_id, key);
+};
+
+PageTask Table::find_leaf_async(uint32_t root_id, uint32_t key, uint32_t& out_leaf_id) {
+    uint32_t current_id = root_id;
+    while (true) {
+        std::shared_ptr<Page> page = co_await pager->get_page_async(current_id);
+                
+        if (page->data[NODE_TYPE_OFFSET] == 1) { // Leaf
+            out_leaf_id = current_id;
+            co_return page;
+        }
+
+        InternalNode internal(page.get(), current_id);
+        current_id = internal.get_child_for_key(key);
     }
 }
 
-Cursor Table::find(uint32_t key) {
-    return Cursor(this, key); 
+
+void Table::increment_total_count() {
+    uint32_t count = get_total_count();
+    auto root_page = pager->read_page(0);
+    serialize_uint32(count + 1, root_page->data + TABLE_TOTAL_COUNT_OFFSET);
+    pager->write_page(0, *root_page);
+};
+
+
+CursorTask Table::find_async(uint32_t key) {
+    // 2. Perform the async search for the leaf
+    uint32_t leaf_id = 0;
+    std::shared_ptr<Page> page = co_await find_leaf_async(root_page_id, key, leaf_id);
+    
+    // 3. Initialize the cursor now that we have the starting page
+    Cursor cursor(this);
+    
+    // 4. Use a private helper to set the internal cursor state
+    // This avoids performing I/O in the constructor
+    cursor.initialize_at_key(leaf_id, key, page);
+    
+    co_return cursor;
 }
 
 
@@ -201,6 +209,31 @@ PageTask Table::update_parent_async(uint32_t parent_id, SplitResult result) {
 }
 
 
+void Table::update_parent(uint32_t parent_id, SplitResult result) {
+    // 1. Get the parent synchronously from the Buffer Pool
+    Page* parent_ptr = pager->get_page(parent_id);
+    InternalNode parent(parent_ptr, parent_id);
+
+    if (parent.get_key_count() < INTERNAL_NODE_MAX_CELLS) {
+        // Simple case: Memory-only modification
+        parent.insert_child(result.split_key, result.new_page_id);
+        pager->mark_dirty(parent_id);
+    } else {
+        // Recursive case: Still synchronous memory operations
+        SplitResult parent_split = parent.split_and_insert_internal(result.split_key, result.new_page_id, *pager);
+
+        uint32_t grandparent_id = parent.get_parent();
+        if (grandparent_id == 0) {
+            // Root split: synchronously handle root creation
+            create_new_root(parent_id, parent_split.split_key, parent_split.new_page_id);
+        } else {
+            // Recursive call: propagate up the tree synchronously
+            update_parent(grandparent_id, parent_split);
+        }
+    }
+}
+
+
 PageTask Table::create_new_root_async(uint32_t left_child_id, uint32_t split_key, uint32_t right_child_id) {
     uint32_t new_root_id = pager->get_unused_page_number();
     std::shared_ptr<Page> root_page_handle = co_await pager->get_page_async(new_root_id);
@@ -229,3 +262,69 @@ PageTask Table::create_new_root_async(uint32_t left_child_id, uint32_t split_key
 
     co_return root_page_handle;
 }
+
+
+void Table::create_new_root(uint32_t left_child_id, uint32_t split_key, uint32_t right_child_id) {
+    uint32_t new_root_id = pager->get_unused_page_number();
+    
+    // These now return a pointer immediately from your internal cache map
+    Page* root_ptr = pager->get_page(new_root_id); 
+    Page* left_ptr = pager->get_page(left_child_id);
+    Page* right_ptr = pager->get_page(right_child_id);
+
+    InternalNode new_root(root_ptr, new_root_id);
+    Node left_node(left_ptr, left_child_id);
+    Node right_node(right_ptr, right_child_id);
+    
+    left_node.set_parent(new_root_id);
+    right_node.set_parent(new_root_id);
+    left_node.set_is_root(0); 
+
+    new_root.initialize_as_root(left_child_id, split_key, right_child_id);
+    this->root_page_id = new_root_id;
+
+    // Mark as dirty instead of flushing synchronously
+    pager->mark_dirty(new_root_id);
+    pager->mark_dirty(left_child_id);
+    pager->mark_dirty(right_child_id);
+}
+
+
+uint32_t Table::get_total_count() {
+    auto root_page = pager->read_page(0);
+    return deserialize_uint32(root_page->data + 4);
+}
+
+
+
+PageTask Table::insert_async(uint32_t key, const char* value) {
+    uint32_t leaf_id;
+
+
+    std::shared_ptr<Page> leaf_page = co_await find_leaf_async(root_page_id, key, leaf_id);
+
+    LeafNode leaf(leaf_page.get(), leaf_id);
+    uint32_t parent_id = leaf.get_parent();
+
+    // 3. Handle the insert/split logic
+    if (leaf.get_key_count() >= LEAF_NODE_MAX_CELLS) {
+        SplitResult result = co_await leaf.split_and_insert_async(key, value, *pager);
+
+        if (parent_id == 0) { // leaf was root
+            create_new_root(uint32_t left_child_id, uint32_t split_key, uint32_t right_child_id);
+        } else {
+            update_parent_async(parent_id, result);
+        }
+
+        co_await FlushAwaiter{pager.get(), leaf_id};
+    } else {
+        leaf.insert(key, value, *pager);
+
+        co_await FlushAwaiter{pager.get(), leaf_id};
+    }
+
+    // 4. Update the global count in the header of Page 0
+    co_await increment_total_count_async();
+
+    co_return leaf_page;
+};

@@ -1,5 +1,7 @@
+#ifndef NODE_HPP
+#define NODE_HPP
+
 #include "page.hpp"
-#include "pager.hpp"
 #include <cstdint>
 
 
@@ -20,8 +22,12 @@ const uint32_t NEXT_PAGE_OFFSET = 16;         // Bytes 16, 17, 18, 19 (Leaf)
 
 // --- DATA START ---
 const uint32_t COMMON_HEADER_SIZE = 20;       // Total header length
-const uint32_t INTERNAL_NODE_CELLS_START = 20; 
+const uint32_t INTERNAL_NODE_CELLS_START = 20;
 const uint32_t LEAF_NODE_CELLS_START = 20;
+
+const uint32_t LEAF_NODE_CELL_SIZE = 36;
+const uint32_t LEAF_NODE_SPACE_FOR_CELLS = PAGE_SIZE - LEAF_NODE_CELLS_START;
+const uint32_t LEAF_NODE_MAX_CELLS = LEAF_NODE_SPACE_FOR_CELLS / LEAF_NODE_CELL_SIZE;
 
 const uint32_t INTERNAL_NODE_MAX_CELLS = (PAGE_SIZE - COMMON_HEADER_SIZE) / 8;
 
@@ -41,35 +47,23 @@ class Node {
 
             Page* get_page() { return page; }
 
-            uint32_t get_page_id() const {
-                return page_id;
-            };
+            uint32_t get_page_id() const;
 
-            void set_parent(uint32_t parent_id) {
-                serialize_uint32(parent_id, page->data + PARENT_POINTER_OFFSET);
-            }
+            void set_parent(uint32_t parent_id);
 
-            uint32_t get_parent() {
-                return deserialize_uint32(page->data + PARENT_POINTER_OFFSET);
-            }
+            uint32_t get_parent();
 
-            // Every node needs to know if it's the root
-            void set_is_root(bool is_root) {
-                uint8_t value = is_root ? 1 : 0;
-                *(page->data + IS_ROOT_OFFSET) = value;
-            }
+            void set_is_root(bool is_root);
 
-            void set_node_type(uint8_t type) { page->data[NODE_TYPE_OFFSET] = type; }
-            uint8_t get_node_type() { return page->data[NODE_TYPE_OFFSET]; }
+            void set_node_type(uint8_t type);
 
-            
+            void set_key_count(uint32_t count);
 
-            void set_key_count(uint32_t count) {
-                serialize_uint32(count, page->data + KEY_COUNT_OFFSET);
-            }
+            uint32_t get_key_count();
 
-            uint32_t get_key_count() {
-                return deserialize_uint32(page->data + KEY_COUNT_OFFSET);
-            }
+            uint8_t get_node_type();
 
 };
+
+
+#endif

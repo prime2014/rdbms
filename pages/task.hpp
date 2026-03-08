@@ -2,40 +2,55 @@
 #define PAGETASK_HPP
 
 #include <coroutine>
+#include <exception>
 #include <memory>
-#include "page.hpp"
+#include <optional>
+#include "node.hpp"
 
 
-// FORWARD DECLARATION: 
-class Pager;
-struct SplitResult result;
+// FORWARD DECLARATION:
+
+class Cursor;
+class Pager; // Forward declare
+class Page;
 
 struct PageTask {
+    struct promise_type;
+
+    struct PageTaskFinalAwaiter : std::suspend_always {
+        void await_suspend(std::coroutine_handle<promise_type> completing) noexcept;
+    };
+
     struct promise_type {
         std::shared_ptr<Page> result_page;
+        std::coroutine_handle<> continuation;
+        std::exception_ptr exception;
 
         PageTask get_return_object() {
             return { std::coroutine_handle<promise_type>::from_promise(*this) };
-        }
+        };
 
-        std::suspend_never initial_suspend() { return {}; }
+        std::suspend_never initial_suspend();
+        PageTaskFinalAwaiter final_suspend() noexcept;
 
-        std::suspend_always final_suspend() noexcept { return {}; }
+        void return_value(std::shared_ptr<Page> p);
 
-        // This handles "co_return some_page"
-        void return_value(std::shared_ptr<Page> p) { result_page = p; }
-        void unhandled_exception() { std::terminate(); }
+        void unhandled_exception();
+
+        
     };
 
     std::coroutine_handle<promise_type> handle;
 
+    ~PageTask() { if (handle) handle.destroy(); }
+
+    PageTask(std::coroutine_handle<promise_type> h) : handle(h) {}
+
     bool await_ready() { return handle.done(); }
 
     // 2. What to do if it's not done (suspend the caller)
-    void await_suspend(std::coroutine_handle<> caller_handle) {
-        // In a simple system, we just let the sub-task run.
-        // For now, we assume initial_suspend was "never", 
-        // so the task is already moving.
+    void await_suspend(std::coroutine_handle<> h) {
+        handle.promise().continuation = h;
     }
 
     // 3. What to return when the co_await finishes
@@ -59,29 +74,36 @@ struct PageAwaiter {
     };
     bool await_ready();
     void await_suspend(std::coroutine_handle<> h);
-    std::shared_ptr<Page> await_resume() {
-        return pager->get_page_from_cache(page_id); 
-    }
+    std::shared_ptr<Page> await_resume();
 };
 
 
 struct VoidTask {
-    Pager* pager;
-    uint32_t page_id;
+    struct promise_type;
+
+    struct VoidTaskFinalAwaiter : std::suspend_always {
+        void await_suspend(std::coroutine_handle<promise_type> completing) noexcept;
+    };
+
+    Pager* pager = nullptr;
+    uint32_t page_id = 0;
+    std::coroutine_handle<promise_type> handle;
 
     struct promise_type {
-        VoidTask get_return_object() { return {}; }
+        std::coroutine_handle<> continuation;
+
+        VoidTask get_return_object() {
+            return { nullptr, 0, std::coroutine_handle<promise_type>::from_promise(*this) };
+        }
         std::suspend_never initial_suspend() { return {}; }
-        std::suspend_never final_suspend() noexcept { return {}; }
+        VoidTaskFinalAwaiter final_suspend() noexcept;
         void unhandled_exception() {}
-        void return_void() {} // ONLY return_void
+        void return_void() {}
     };
 
     bool await_ready();
     void await_suspend(std::coroutine_handle<> h);
-    std::shared_ptr<Page> await_resume() {
-        return pager->get_page_from_cache(page_id); 
-    }
+    std::shared_ptr<Page> await_resume();
 };
 
 
@@ -90,18 +112,8 @@ struct FlushAwaiter {
     uint32_t page_id;
 
     bool await_ready() { return false; } // Always suspend to simulate I/O
-    void await_suspend(std::coroutine_handle<> h) {
-        pager->schedule_write(page_id, h);
-    }
-    void await_resume() { 
-        // Return nothing! The write is done.
-    }
-};
-
-
-struct SplitResult {
-    uint32_t split_key;
-    uint32_t new_page_id;
+    void await_suspend(std::coroutine_handle<> h);
+    void await_resume();
 };
 
 
@@ -130,6 +142,12 @@ struct SplitTask {
     // Cleanup
     ~SplitTask() { if (handle) handle.destroy(); }
 };
+
+
+
+
+
+
 
 
 #endif
