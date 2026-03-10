@@ -8,12 +8,14 @@
 #include <cstdint>
 #include <cstring>
 #include <unordered_map>
+#include <unordered_set>
 #include "task.hpp"
 #include <vector>
 #include <sys/uio.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <liburing.h>
+#include <iostream>
 
 class Pager {
     private:
@@ -28,7 +30,8 @@ class Pager {
         std::shared_ptr<Page> last_page_pin;
         uint32_t last_page_id = 0xFFFFFFFF;
         std::unordered_map<uint32_t, std::shared_ptr<Page>> page_cache;
-        std::unordered_map<uint32_t, std::coroutine_handle<>> pending_io;    
+        std::unordered_map<uint32_t, std::coroutine_handle<>> pending_io;   
+        std::unordered_set<uint32_t> dirty_pages; 
         const size_t BATCH_THRESHOLD = 16;
 
         // Memory-only test mode: no file, no io_uring; completions are simulated
@@ -40,6 +43,8 @@ class Pager {
         Pager(const std::string& filename, bool memory_only = false);
         ~Pager();
 
+        void submit_to_kernel();
+
         int get_fd();
 
         void submit_all();
@@ -48,16 +53,20 @@ class Pager {
 
         std::shared_ptr<Page> get_page_from_cache(uint32_t page_id);
 
+        Page* get_page(uint32_t page_id);
+        void mark_dirty(uint32_t page_id);
 
         void schedule_write(uint32_t page_id, std::coroutine_handle<> h);
 
-
-        void submit_write(uint32_t page_id, std::coroutine_handle<> h);
+        void submit_write(uint32_t page_id, 
+                         std::coroutine_handle<> h, 
+                         std::shared_ptr<std::atomic<size_t>> counter = {});
 
         void shutdown_gracefully();
 
-        void process_completions();
+        void process_completions(bool wait);
 
+        MultiFlushAwaiter flush_all_dirty_async();
 
         void mark_as_dirty(uint32_t page_id);
 
@@ -88,6 +97,8 @@ class Pager {
 
         // Writes a page from RAM back to the specific slot on disk
         void write_page(uint32_t page_id, const Page& page);
+
+        friend struct MultiFlushAwaiter;
 };
 
 
@@ -101,6 +112,17 @@ inline uint32_t deserialize_uint32(char* source) {
     uint32_t value;
     std::memcpy(&value, source, sizeof(uint32_t));
     return value;
+}
+
+inline void serialize_string_32(const char* source, char* destination) {
+    std::memset(destination, 0, 32);
+    std::strncpy(destination, source, 31);
+
+    // ADD THIS:
+    if (std::strstr(destination, "Progress") != nullptr) {
+        std::cerr << "CRITICAL: Corrupted data detected before write!" << std::endl;
+        std::exit(1); 
+    }
 }
 
 #endif

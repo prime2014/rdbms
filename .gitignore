@@ -10,6 +10,8 @@ main.exe
 # These should stay local to your machine
 data/*.db
 data/*.bin
+my_database.db
+my_db
 
 # --- IDE & System Files ---
 .vscode/

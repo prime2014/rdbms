@@ -122,22 +122,22 @@ SplitTask InternalNode::split_and_insert_internal_async(uint32_t split_key, uint
 }
 
 uint32_t InternalNode::get_child(uint32_t child_idx) {
-    char* addr = page->data + INTERNAL_NODE_CELLS_START + (child_idx * 8);
+    char* addr = page->data + INTERNAL_NODE_CELLS_START + (child_idx * 8) + 4;
     return deserialize_uint32(addr);
 }
 
 void InternalNode::set_child(uint32_t child_idx, uint32_t child_id) {
-    char* addr = page->data + INTERNAL_NODE_CELLS_START + (child_idx * 8);
+    char* addr = page->data + INTERNAL_NODE_CELLS_START + (child_idx * 8) + 4;
     serialize_uint32(child_id, addr);
 }
 
 uint32_t InternalNode::get_key(uint32_t key_idx) {
-    char* addr = page->data + INTERNAL_NODE_CELLS_START + (key_idx * 8) + 4;
+    char* addr = page->data + INTERNAL_NODE_CELLS_START + (key_idx * 8); 
     return deserialize_uint32(addr);
 }
 
 void InternalNode::set_key(uint32_t key_idx, uint32_t key) {
-    char* addr = page->data + INTERNAL_NODE_CELLS_START + (key_idx * 8) + 4;
+    char* addr = page->data + INTERNAL_NODE_CELLS_START + (key_idx * 8);
     serialize_uint32(key, addr);
 }
 
@@ -182,3 +182,66 @@ bool InternalNode::is_root() const {
 }
 
 Page* InternalNode::get_page() { return this->page; }
+
+SplitResult InternalNode::split_and_insert_internal(uint32_t split_key, uint32_t child_id, Pager& pager) {
+
+    uint32_t new_page_id = pager.get_unused_page_number();
+    Page* new_page_ptr = pager.get_page(new_page_id);
+    InternalNode new_sibling(new_page_ptr, new_page_id);
+
+    // Initialize the new sibling with metadata
+    new_sibling.set_is_root(false);
+    new_sibling.set_node_type(NODE_INTERNAL);
+
+    // get key count 
+    uint32_t key_count = this->get_key_count();
+    
+    // 1. Index of the key to promote
+    uint32_t middle_idx = key_count / 2;
+
+    // 2. Start copying from the key immediately AFTER the promoted key
+    // If middle_idx is 5, we copy starting at index 6.
+    uint32_t start_copy_idx = middle_idx + 1; 
+
+    // 3. Bytes to copy = (Total remaining keys) * 8
+    uint32_t keys_to_move = key_count - start_copy_idx;
+    uint32_t bytes_to_move = keys_to_move * 8;
+
+    // 4. Perform the copy
+    std::memcpy(
+        new_sibling.page->data + INTERNAL_NODE_CELLS_START, 
+        this->page->data + INTERNAL_NODE_CELLS_START + (start_copy_idx * 8), 
+        bytes_to_move
+    );
+
+    for (uint32_t i = 0; i < keys_to_move; ++i) {
+        // Each cell is 8 bytes: 4 bytes key, 4 bytes child_id
+        uint32_t child_id = *reinterpret_cast<uint32_t*>(new_sibling.page->data + 
+                            INTERNAL_NODE_CELLS_START + (i * 8) + 4);
+        
+        // Get the child page and update its parent
+        Page* child_ptr = pager.get_page(child_id);
+        Node child_node(child_ptr, child_id);
+        child_node.set_parent(new_sibling.page_id);
+        
+        // Mark the child as dirty because we changed its parent pointer
+        pager.mark_dirty(child_id);
+    }
+
+
+    uint32_t promoted_key = *reinterpret_cast<uint32_t*>(this->page->data + INTERNAL_NODE_CELLS_START + (middle_idx * 8));
+    uint32_t right_child_id = *reinterpret_cast<uint32_t*>(this->page->data + INTERNAL_NODE_CELLS_START + (middle_idx * 8) + 4);
+
+    new_sibling.set_parent(this->get_parent());
+    this->set_key_count(middle_idx);
+    new_sibling.set_key_count(keys_to_move);
+
+    new_sibling.set_leftmost_child(right_child_id);
+
+    pager.mark_dirty(this->page_id);
+    pager.mark_dirty(new_page_id);
+
+    return { promoted_key, new_page_id };
+}
+
+

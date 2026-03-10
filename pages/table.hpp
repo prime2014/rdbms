@@ -44,11 +44,11 @@ class Table {
         
         PageTask insert_async(uint32_t key, const char* value);
 
-        void Table::update_parent(uint32_t parent_id, SplitResult result);
+        void update_parent(uint32_t parent_id, SplitResult result);
 
         CursorTask find_async(uint32_t key);
 
-        VoidTask increment_total_count_async();
+        void increment_total_count_sync();
 
         uint32_t get_total_count();
 

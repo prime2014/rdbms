@@ -6,7 +6,7 @@
 #include <memory>
 #include <optional>
 #include "node.hpp"
-
+#include <atomic>
 
 // FORWARD DECLARATION:
 
@@ -78,32 +78,46 @@ struct PageAwaiter {
 };
 
 
+
+
+// Revised VoidTask (Pure Task handle)
 struct VoidTask {
-    struct promise_type;
-
-    struct VoidTaskFinalAwaiter : std::suspend_always {
-        void await_suspend(std::coroutine_handle<promise_type> completing) noexcept;
-    };
-
-    Pager* pager = nullptr;
-    uint32_t page_id = 0;
-    std::coroutine_handle<promise_type> handle;
-
     struct promise_type {
+        std::atomic<bool> is_done{false};
         std::coroutine_handle<> continuation;
-
-        VoidTask get_return_object() {
-            return { nullptr, 0, std::coroutine_handle<promise_type>::from_promise(*this) };
-        }
+        VoidTask get_return_object() { return { std::coroutine_handle<promise_type>::from_promise(*this) }; }
         std::suspend_never initial_suspend() { return {}; }
-        VoidTaskFinalAwaiter final_suspend() noexcept;
-        void unhandled_exception() {}
+        auto final_suspend() noexcept { return FinalAwaiter{continuation}; }
+        void unhandled_exception() { std::terminate(); }
         void return_void() {}
     };
 
-    bool await_ready();
-    void await_suspend(std::coroutine_handle<> h);
-    std::shared_ptr<Page> await_resume();
+    struct FinalAwaiter {
+        std::coroutine_handle<> continuation;
+        bool await_ready() noexcept { return !continuation; }
+        void await_suspend(std::coroutine_handle<promise_type> h) noexcept { continuation.resume(); }
+        void await_resume() noexcept {}
+    };
+
+    std::coroutine_handle<promise_type> handle;
+    // Remove pager/page_id from here!
+
+    bool await_ready() { 
+        return handle && handle.done(); 
+    }
+    
+    void await_suspend(std::coroutine_handle<> h) {
+        // When this task is awaited, attach the caller (h) as a continuation
+        handle.promise().continuation = h;
+    }
+    
+    void await_resume() {}
+    
+    ~VoidTask() { if (handle) handle.destroy(); }
+
+    bool is_done() const {
+        return handle ? handle.promise().is_done.load() : true;
+    }
 };
 
 
@@ -146,7 +160,21 @@ struct SplitTask {
 
 
 
+struct MultiFlushAwaiter {
+    Pager* pager;
+    std::vector<uint32_t> page_ids;
+    std::shared_ptr<std::atomic<size_t>> remaining;
+    bool ready;
+    // Constructor
+    MultiFlushAwaiter(Pager* p, std::vector<uint32_t> ids, std::shared_ptr<std::atomic<size_t>> rem, bool r = false)
+        : pager(p), page_ids(std::move(ids)), remaining(rem), ready(r) {}
 
+    bool await_ready() { return page_ids.empty(); }
+
+    void await_suspend(std::coroutine_handle<> h);
+
+    void await_resume() {}
+};
 
 
 

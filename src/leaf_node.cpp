@@ -12,26 +12,22 @@ char* LeafNode::cell_address(uint32_t cell_num) {
     return page->data + LEAF_NODE_CELLS_START + (cell_num * LEAF_NODE_CELL_SIZE);
 }
 
-// Change return type to Task<SplitResult>
+
 SplitTask LeafNode::split_and_insert_async(uint32_t key, const char* value, Pager& pager) {
-
     uint32_t new_page_id = pager.get_unused_page_number();
-
-    // 1. Get the new page (potential suspension)
     std::shared_ptr<Page> new_page_handle = co_await pager.get_page_async(new_page_id);
     LeafNode new_leaf(new_page_handle.get(), new_page_id);
 
-    // 2. Memory Shuffle (No suspension)
+    // 1. Perform the memory shuffle
     uint32_t split_key = perform_memory_split(key, value, new_leaf);
 
+    // 2. Mark everything dirty (No co_await here!)
+    pager.mark_dirty(this->get_page_id());
+    pager.mark_dirty(new_page_id);
 
-    // 4. Persistence (Potential suspension - "Hitching a Ride")
-    co_await pager.flush_page_async(this->get_page_id());
-    co_await pager.flush_page_async(new_page_id);
-
-    // 5. Return the metadata required by the parent node
     co_return SplitResult{ split_key, new_page_id };
 }
+
 
 uint32_t LeafNode::get_parent() {
     return deserialize_uint32(this->page->data + PARENT_POINTER_OFFSET);
@@ -55,7 +51,8 @@ uint32_t LeafNode::perform_memory_split(uint32_t key, const char* value, LeafNod
     
     // Insert new record into buffer
     serialize_uint32(key, (char*)buffer.data() + (insertion_idx * LEAF_NODE_CELL_SIZE));
-    std::memcpy((char*)buffer.data() + (insertion_idx * LEAF_NODE_CELL_SIZE) + 4, value, 32);
+
+    serialize_string_32(value, (char*)buffer.data() + (insertion_idx * LEAF_NODE_CELL_SIZE) + 4);
 
     // Copy remainder
     std::memcpy((char*)buffer.data() + ((insertion_idx + 1) * LEAF_NODE_CELL_SIZE), 
@@ -143,9 +140,15 @@ char* LeafNode::get_value(uint32_t cell_num) {
 }
 
 void LeafNode::set_value(uint32_t cell_num, const char* value_ptr) {
-    // We assume the value size is (LEAF_NODE-CELL_SIZE -4)
     uint32_t value_size = LEAF_NODE_CELL_SIZE - sizeof(uint32_t);
-    std::memcpy(get_value(cell_num), value_ptr, value_size);
+    char* dest = get_value(cell_num);
+
+    // 1. Clear the destination first to remove any "ghost" data
+    std::memset(dest, 0, value_size);
+
+    // 2. Copy only the string contents, not the extra memory after it
+    // Use strncpy to safely copy up to the buffer size
+    std::strncpy(dest, value_ptr, value_size - 1);
 }
 
 

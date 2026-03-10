@@ -76,27 +76,25 @@ PageTask Table::insert(uint32_t key, const char* value) {
     }
 
             // 4. Update the global count
-    co_await increment_total_count_async();
+    increment_total_count_sync();
             
     co_return leaf_page;
 };
 
 
-VoidTask Table::increment_total_count_async() {
-   std::shared_ptr<Page> page_header =  co_await this->pager->get_page_async(0);
+void Table::increment_total_count_sync() {
+    // Get Page 0 (Header)
+    Page* page_header = pager->get_page(0); 
 
-   uint32_t current_count = 0;
-
-   std::memcpy(&current_count, &page_header->data[TABLE_TOTAL_COUNT_OFFSET], sizeof(uint32_t));
-
-   current_count++;
-
-   std::memcpy(&page_header->data[TABLE_TOTAL_COUNT_OFFSET], &current_count, sizeof(uint32_t));
-
-   co_await this->pager->flush_page_async(0);
-
-   co_return;
+    uint32_t current_count = 0;
+    std::memcpy(&current_count, &page_header->data[TABLE_TOTAL_COUNT_OFFSET], sizeof(uint32_t));
     
+    current_count++;
+    
+    std::memcpy(&page_header->data[TABLE_TOTAL_COUNT_OFFSET], &current_count, sizeof(uint32_t));
+
+    // Just mark it dirty; let the final flush handle the disk I/O
+    pager->mark_dirty(0);
 }
 
 
@@ -141,6 +139,8 @@ uint32_t Table::find_leaf(uint32_t page_id, uint32_t key) {
 
 PageTask Table::find_leaf_async(uint32_t root_id, uint32_t key, uint32_t& out_leaf_id) {
     uint32_t current_id = root_id;
+
+    std::cout << "DEBUG: Searching for page " << current_id << std::endl;
     while (true) {
         std::shared_ptr<Page> page = co_await pager->get_page_async(current_id);
                 
@@ -298,33 +298,34 @@ uint32_t Table::get_total_count() {
 
 
 PageTask Table::insert_async(uint32_t key, const char* value) {
+    std::cout << "DEBUG: insert_async started" << std::endl;
     uint32_t leaf_id;
-
-
     std::shared_ptr<Page> leaf_page = co_await find_leaf_async(root_page_id, key, leaf_id);
-
+    std::cout << "DEBUG: Leaf found! Inserting key..." << std::endl;
     LeafNode leaf(leaf_page.get(), leaf_id);
-    uint32_t parent_id = leaf.get_parent();
 
-    // 3. Handle the insert/split logic
     if (leaf.get_key_count() >= LEAF_NODE_MAX_CELLS) {
         SplitResult result = co_await leaf.split_and_insert_async(key, value, *pager);
-
-        if (parent_id == 0) { // leaf was root
-            create_new_root(uint32_t left_child_id, uint32_t split_key, uint32_t right_child_id);
+        
+        uint32_t old_parent_id = leaf.get_parent(); // Capture before any changes
+        if (old_parent_id == 0) {
+            create_new_root(leaf_id, result.split_key, result.new_page_id);
         } else {
-            update_parent_async(parent_id, result);
+            update_parent(old_parent_id, result);
         }
-
-        co_await FlushAwaiter{pager.get(), leaf_id};
+        
+        // At this point, several pages are marked "dirty" in the pager:
+        // leaf_id, result.new_page_id, and all parents up to the root.
     } else {
         leaf.insert(key, value, *pager);
-
-        co_await FlushAwaiter{pager.get(), leaf_id};
+        pager->mark_dirty(leaf_id);
     }
 
-    // 4. Update the global count in the header of Page 0
-    co_await increment_total_count_async();
+    // Update count (Sync memory change + mark dirty)
+    increment_total_count_sync();
+
+    // FINAL COMMIT: Flush everything touched by this operation
+    co_await pager->flush_all_dirty_async(); 
 
     co_return leaf_page;
-};
+}

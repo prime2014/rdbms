@@ -36,6 +36,8 @@ public:
     uint32_t get_child_for_key(uint32_t key);
 
     PageAwaiter initialize_as_root(uint32_t left_child_id, uint32_t split_key, uint32_t right_child_id);
+
+    SplitResult split_and_insert_internal(uint32_t split_key, uint32_t new_page_id, Pager& pager);
     
     SplitResult split_and_insert(SplitResult result, Pager& pager);
 
