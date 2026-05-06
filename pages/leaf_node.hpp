@@ -10,7 +10,7 @@ struct SplitTask;
 
 class LeafNode: public Node {
     public:
-        LeafNode(Page* p, uint32_t id): Node(p, id) {};
+        LeafNode(std::shared_ptr<Page> p, uint32_t id, Pager* pg = nullptr) : Node(p, id, pg) {};
 
         char* cell_address(uint32_t cell_num);
 
@@ -39,7 +39,7 @@ class LeafNode: public Node {
 
         SplitResult insert(uint32_t key, const char* value, Pager& pager);
 
-        SplitTask split_and_insert_async(uint32_t key, const char* valur, Pager& pager);
+        SplitTask split_and_insert_async(uint32_t key, const char* value, Pager& pager);
 
     
 };

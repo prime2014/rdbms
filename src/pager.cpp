@@ -7,13 +7,17 @@
 #include <coroutine>
 #include <liburing.h>
 #include <stdexcept>
+#include "../pages/wal_debug.hpp"
+#include "../pages/context.hpp"
 
 
-struct IOContext {
-    std::coroutine_handle<> handle;
-    uint32_t page_id;
-    std::shared_ptr<std::atomic<size_t>> batch_counter;
-    std::unique_ptr<char[]> write_buffer;
+
+struct InsertContext {
+    uint32_t key;
+    std::string value;
+    std::vector<uint32_t> affected_pages;
+    std::shared_ptr<BatchContext> batch_ctx; // The same latch we discussed
+    bool is_complete = false;
 };
 
 
@@ -56,49 +60,126 @@ Pager::~Pager() {
     if (this->fd >= 0) close(this->fd);
 }
 
-// --- Async I/O Core ---
+
+std::shared_ptr<Page> Pager::get_root_shared() {
+    // 1. Check the dedicated pin first
+    if (root_cache) {
+        return root_cache;
+    }
+
+    // 2. Fallback: If root_cache is null, check the general cache
+    // Note: You'll need to know which ID is the root. 
+    // In a real DB, the Table class usually passes this ID.
+    auto it = page_cache.find(1); // Assuming 1 is initial root
+    if (it != page_cache.end()) {
+        return it->second;
+    }
+
+    // 3. Absolute Fallback: Error or forced load
+    std::cerr << "CRITICAL: Root page not found in cache!" << std::endl;
+    return nullptr; 
+}
+
+
+
+
+
+void Pager::pin_root(uint32_t root_id, std::shared_ptr<Page> existing_page) {
+    if (existing_page) {
+        // Use the page we just created in the constructor
+        this->page_cache[root_id] = existing_page;
+        this->root_cache = existing_page;
+        std::cout << "DEBUG: Pinning: Using provided page " << root_id << std::endl;
+    } else {
+        // Fallback to disk read
+        auto it = page_cache.find(root_id);
+        if (it == page_cache.end()) {
+            auto page = read_page(root_id);
+            this->root_cache = page_cache[root_id];
+        } else {
+            this->root_cache = it->second;
+        }
+    }
+}
+
+
+std::shared_ptr<Page> Pager::get_page_shared(uint32_t page_id) {
+    auto it = page_cache.find(page_id);
+
+    // 1. If it's already in the cache, just return the pointer
+    if (it != page_cache.end()) {
+        return it->second;
+    }
+
+    // 2. Cache Miss: Perform a synchronous read
+    // This is used during startup or specific sync operations
+    auto page = std::make_shared<Page>();
+    ssize_t bytes = pread(this->fd, page->data, PAGE_SIZE, (off_t)page_id * PAGE_SIZE);
+    
+    if (bytes < 0) throw std::runtime_error("Sync read failed for page " + std::to_string(page_id));
+    
+    // Ensure the rest of the page is clean if it's a partial read
+    if (bytes < PAGE_SIZE) std::memset(page->data + bytes, 0, PAGE_SIZE - bytes);
+
+    // 3. Save to cache and return
+    page_cache[page_id] = page;
+    return page;
+}
+
+
+
+
 
 void Pager::process_completions(bool wait) {
     struct io_uring_cqe* cqe;
-    int res;
-
-    // 1. Handle the initial wait attempt with signal resiliency
+    
+    // 1. Wait for at least one completion if requested
     if (wait) {
-        while ((res = io_uring_wait_cqe(&ring, &cqe)) == -EINTR) {
-            // Signal interrupted the wait; retry immediately
-            continue; 
-        }
-    } else {
-        res = io_uring_peek_cqe(&ring, &cqe);
+        int ret;
+        // Standard io_uring wait loop to handle signal interruptions (EINTR)
+        while ((ret = io_uring_wait_cqe(&ring, &cqe)) == -EINTR);
+        if (ret < 0) return;
     }
 
-    // 2. Drain the queue
-    while (res == 0 && cqe) {
-        // Retrieve the pointer we gave to the kernel
-        IOContext* ctx = static_cast<IOContext*>(io_uring_cqe_get_data(cqe));
+    std::vector<std::coroutine_handle<>> tasks_to_resume;
 
-        std::cout << "DEBUG: [3] Event found! Resuming coroutine for page: " << ctx->page_id << std::endl;
-
+    // 2. Peek through all available CQEs
+    while (io_uring_peek_cqe(&ring, &cqe) == 0) {
+        IOContext* ctx = reinterpret_cast<IOContext*>(io_uring_cqe_get_data(cqe));
         
         if (ctx) {
-            this->clear_dirty(ctx->page_id);
-            
-            // Handle batch logic if needed
-            if (ctx->batch_counter && ctx->batch_counter->fetch_sub(1) > 1) {
-                // Not the last one yet, don't resume
-            } else {
-                ctx->handle.resume();
+            // 1. Handle READ Operations (Page Loading)
+            if (pending_io.count(ctx->page_id)) {
+                auto& entry = pending_io[ctx->page_id];
+                
+                // Move the loaded data into the cache
+                page_cache[ctx->page_id] = entry.page_buffer;
+                
+                // Collect all handles waiting for this specific page
+                for (auto h : entry.waiters) {
+                    tasks_to_resume.push_back(h);
+                }
+                pending_io.erase(ctx->page_id);
+            } 
+            // 2. Handle WRITE Operations (Flushing/Barriers)
+            else if (ctx->batch) {
+                auto& batch = ctx->batch;
+                if (batch->counter.fetch_sub(1) == 1) {
+                    bool expected = false;
+                    if (batch->resumed.compare_exchange_strong(expected, true)) {
+                        tasks_to_resume.push_back(batch->handle);
+                    }
+                }
             }
             
-            // CRITICAL: Delete the heap memory to prevent leaks and dangling pointers
             delete ctx; 
         }
-
         io_uring_cqe_seen(&ring, cqe);
-        
-        // Peek for more items. No need to retry EINTR on peek_cqe 
-        // because it doesn't block the thread.
-        res = io_uring_peek_cqe(&ring, &cqe);
+    }
+
+    // 3. Resume the collected tasks outside the CQE loop
+    for (auto h : tasks_to_resume) {
+        h.resume();
     }
 }
 
@@ -126,40 +207,32 @@ void Pager::schedule_write(uint32_t page_id, std::coroutine_handle<> h) {
 }
 
 void Pager::schedule_async_load(uint32_t page_id, std::coroutine_handle<> h) {
-    std::cout << "DEBUG: Submitting read for page " << page_id << std::endl;
-    if (memory_only_) {
-        if (page_cache.find(page_id) == page_cache.end()) {
-            page_cache[page_id] = std::make_shared<Page>();
-        }
-        memory_pending_resumes_.push_back(h);
+    // 1. Double-Check Cache (Safety first)
+    if (page_cache.find(page_id) != page_cache.end()) {
+        std::cout << "DEBUG: Page " << page_id << " landed in cache during suspension." << std::endl;
+        h.resume(); 
         return;
     }
 
-    // Create the context on the HEAP so it survives after this function ends
-    IOContext* ctx = new IOContext{h, page_id, nullptr}; 
-
     auto page = std::make_shared<Page>();
-    page_cache[page_id] = page;
+    pending_io[page_id] = { OpType::READ, {h}, page };
+
+    // Create a context wrapper for the Read operation
+    // We use the single-handle constructor for IOContext
+    IOContext* ctx = new IOContext(h, page_id, nullptr);
 
     struct io_uring_sqe* sqe = io_uring_get_sqe(&ring);
-
     io_uring_prep_read(sqe, fd, page->data, PAGE_SIZE, (off_t)page_id * PAGE_SIZE);
     
-    // Pass the HEAP POINTER to the kernel
-    io_uring_sqe_set_data(sqe, ctx);
-
-    std::cout << "DEBUG: [1] I/O Request submitted to SQ for page " << page_id << std::endl;
-
-    int ret = io_uring_submit(&ring);
-
-    if (ret < 0) {
-        std::cerr << "io_uring_submit failed: " << ret << std::endl;
-    }
+    // Pass the pointer, not the ID
+    io_uring_sqe_set_data(sqe, ctx); 
+    io_uring_submit(&ring);
 }
 
 // --- Synchronous Fallbacks & Metadata ---
 
 void Pager::write_page(uint32_t page_id, const Page& page) {
+    std::cout << "Writing page: " << page_id << std::endl;
     off_t offset = (off_t)page_id * PAGE_SIZE;
     if (pwrite(this->fd, page.data, PAGE_SIZE, offset) == -1) {
         throw std::runtime_error("Synchronous write failed");
@@ -169,18 +242,29 @@ void Pager::write_page(uint32_t page_id, const Page& page) {
         file_length = offset + PAGE_SIZE;
         num_pages = file_length / PAGE_SIZE;
     }
+
 }
 
-std::unique_ptr<Page> Pager::read_page(uint32_t page_id) {
+
+
+std::shared_ptr<Page> Pager::read_page(uint32_t page_id) {
+    // 1. Create the page
     auto page = std::make_shared<Page>();
+    
+    // 2. Read directly into the shared memory
     ssize_t bytes = pread(this->fd, page->data, PAGE_SIZE, (off_t)page_id * PAGE_SIZE);
     
     if (bytes < 0) throw std::runtime_error("Sync read failed");
     if (bytes < PAGE_SIZE) std::memset(page->data + bytes, 0, PAGE_SIZE - bytes);
 
+    // 3. Store in cache
     page_cache[page_id] = page;
-    return std::make_unique<Page>(*page);
+
+    // 4. Return the SHARED pointer. No copying!
+    return page;
 }
+
+
 
 // --- Awaiter Factories ---
 
@@ -189,6 +273,7 @@ FlushAwaiter Pager::flush_page_async(uint32_t page_id) {
 }
 
 PageAwaiter Pager::get_page_async(uint32_t page_id) {
+    std::cout << "DEBUG: Requesting page " << page_id << std::endl;
     return PageAwaiter{this, page_id};
 }
 
@@ -196,17 +281,12 @@ PageAwaiter Pager::get_page_async(uint32_t page_id) {
 
 Page* Pager::get_page(uint32_t page_id) {
     auto it = page_cache.find(page_id);
-
     if (it != page_cache.end()) {
         return it->second.get();
     }
 
-    // 2. Cache Miss: Load from disk (Slow Path)
-    // Assuming 'read_page' is your existing synchronous method
-    auto handle = read_page(page_id);
-    page_cache[page_id] = std::shared_ptr<Page>(std::move(handle));
-
-    return page_cache[page_id].get();
+    // This now returns the shared_ptr, and we just grab the raw pointer for the Node
+    return read_page(page_id).get(); 
 }
 
 
@@ -243,7 +323,30 @@ bool Pager::is_ring_idle() {
     return memory_only_ ? true : (io_uring_sq_ready(&ring) == 0);
 }
 
-uint32_t Pager::get_unused_page_number() { return num_pages; }
+uint32_t Pager::get_unused_page_number() {
+    uint32_t new_id = num_pages;
+    num_pages++;
+
+    // 1. Physically stretch the file on disk
+    if (this->fd != -1) {
+        if (ftruncate(this->fd, (off_t)num_pages * PAGE_SIZE) == -1) {
+            throw std::runtime_error("CRITICAL: Failed to extend database file! Check disk space.");
+        }
+    }
+
+    // 2. SHORTCUT: Put a blank page in the cache immediately
+    auto blank_page = std::make_shared<Page>();
+    std::memset(blank_page->data, 0, PAGE_SIZE);
+    
+    // By putting it in the cache now, get_page_async will find it 
+    // in memory and won't trigger an io_uring disk read.
+    page_cache[new_id] = blank_page;
+
+    std::cout << "DEBUG: Allocated New Page " << new_id << " (Skipping Disk Read)" << std::endl;
+    return new_id;
+}
+
+
 uint32_t Pager::get_num_pages() { return num_pages; }
 int Pager::get_fd() { return fd; }
 
@@ -255,26 +358,41 @@ void Pager::submit_to_kernel() {
 
 
 void Pager::submit_write(uint32_t page_id, 
-                         std::coroutine_handle<> h, 
-                         std::shared_ptr<std::atomic<size_t>> counter) { 
+                         std::shared_ptr<BatchContext> batch) { 
     
-    // 1. Calculate the offset based on the page_id
     off_t offset = static_cast<off_t>(page_id) * PAGE_SIZE;
 
-    // 2. Snapshot the data
+    // Snapshot the data to avoid race conditions if the page is modified during IO
     auto buffer_snapshot = std::make_unique<char[]>(PAGE_SIZE);
     std::memcpy(buffer_snapshot.get(), page_cache[page_id]->data, PAGE_SIZE);
 
     struct io_uring_sqe* sqe = io_uring_get_sqe(&ring);
-    
-    // 3. Point the kernel at the snapshot
+    if (!sqe) return; // Always check for ring fullness
+
     io_uring_prep_write(sqe, fd, buffer_snapshot.get(), PAGE_SIZE, offset);
     
-    // 4. Important: Store the buffer snapshot in your IOContext
-    // Ensure your IOContext struct has a member like: std::unique_ptr<char[]> write_buffer;
-    IOContext* ctx = new IOContext{h, page_id, counter, std::move(buffer_snapshot)};
+    // Now the arguments match: (shared_ptr<BatchContext>, uint32_t, unique_ptr<char[]>)
+    IOContext* ctx = new IOContext(batch, page_id, std::move(buffer_snapshot));
+    
     io_uring_sqe_set_data(sqe, ctx);
 }
+
+
+bool Pager::can_perform_op(uint32_t page_id, OpType requested_op) {
+    auto it = pending_io.find(page_id);
+
+    if (it == pending_io.end()) return true; // Nothing pending, proceed
+
+    // If there is an existing operation
+    if (requested_op == OpType::READ) {
+        // Can read if the existing op is also a READ
+        return it->second.operation == OpType::READ;
+    }
+
+    // Writes require total exclusivity
+    return false;
+}
+
 
 // 2. New submit_all method
 void Pager::submit_all() {
@@ -309,18 +427,20 @@ void Pager::async_load_from_disk(uint32_t page_id) {
     io_uring_submit(&ring);
 }
 
-
 MultiFlushAwaiter Pager::flush_all_dirty_async() {
+    // If nothing to flush, the awaiter handles immediate resumption
     if (dirty_pages.empty()) {
-        // Now it uses the new constructor with the 4th argument as 'true'
         return MultiFlushAwaiter{this, {}, nullptr, true}; 
     }
 
+    // Capture the current dirty set
     std::vector<uint32_t> ids(dirty_pages.begin(), dirty_pages.end());
     dirty_pages.clear();
 
+    // We pass the RAW size (or a shared_ptr to it) to the awaiter.
+    // The Awaiter will be responsible for putting this into the 
+    // BatchContext tether once it has the coroutine handle 'h'.
     auto counter = std::make_shared<std::atomic<size_t>>(ids.size());
     
-    // Uses constructor, 'ready' defaults to false
     return MultiFlushAwaiter{this, std::move(ids), counter};
 }

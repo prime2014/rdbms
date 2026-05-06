@@ -12,7 +12,8 @@ data/*.db
 data/*.bin
 my_database.db
 my_db
-
+db_engine
+engine_debug.log
 # --- IDE & System Files ---
 .vscode/
 .DS_Store

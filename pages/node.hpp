@@ -3,7 +3,11 @@
 
 #include "page.hpp"
 #include <cstdint>
+#include "page_header.hpp"
+#include <memory>
 
+
+class Pager;
 
 // --- TABLE LEVEL METADATA (Special 4-byte slot only used in Page 0) ---
 const uint32_t TABLE_TOTAL_COUNT_OFFSET = 4;  // Bytes 4, 5, 6, 7
@@ -26,26 +30,34 @@ const uint32_t INTERNAL_NODE_CELLS_START = 20;
 const uint32_t LEAF_NODE_CELLS_START = 20;
 
 const uint32_t LEAF_NODE_CELL_SIZE = 36;
-const uint32_t LEAF_NODE_SPACE_FOR_CELLS = PAGE_SIZE - LEAF_NODE_CELLS_START;
+const uint32_t LEAF_NODE_SPACE_FOR_CELLS = PAGE_SIZE - sizeof(PageHeader);
 const uint32_t LEAF_NODE_MAX_CELLS = LEAF_NODE_SPACE_FOR_CELLS / LEAF_NODE_CELL_SIZE;
 
-const uint32_t INTERNAL_NODE_MAX_CELLS = (PAGE_SIZE - COMMON_HEADER_SIZE) / 8;
+
+const uint32_t INTERNAL_NODE_MAX_CELLS = (PAGE_SIZE - sizeof(PageHeader)) / 8;
 
 struct SplitResult {
     uint32_t split_key;
     uint32_t new_page_id;
 };
 
+enum NodeType {
+    NODE_INVALID = 0,      // important: 0 = invalid/uninitialized
+    NODE_INTERNAL = 1,
+    NODE_LEAF = 2,
+    NODE_META = 3
+};
 
 class Node {
     protected:
-        Page *page;
+        std::shared_ptr<Page> page; // Ownership!
+        Pager* pager;
         uint32_t page_id;
     
         public:
-            Node(Page* p, uint32_t id): page(p), page_id(id) {};
+            Node(std::shared_ptr<Page> p, uint32_t id, Pager* pg = nullptr): page(p), pager(pg), page_id(id) {};
 
-            Page* get_page() { return page; }
+            std::shared_ptr<Page> get_page() { return page; }
 
             uint32_t get_page_id() const;
 
@@ -62,6 +74,14 @@ class Node {
             uint32_t get_key_count();
 
             uint8_t get_node_type();
+
+            void set_sibling(uint32_t sibling_id);
+
+            void set_left_child(uint32_t left_child_id);
+
+            void validate_node();
+
+            void init_new_node(uint8_t type, bool is_root);
 
 };
 

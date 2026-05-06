@@ -13,10 +13,7 @@ struct SplitTask;
 
 // Header: 0-15 (Standard Node Headers), 16-19 (Leftmost Child), 20+ (Cells)
 
-enum NodeType {
-    NODE_INTERNAL = 0,
-    NODE_LEAF = 1
-};
+
 
 class InternalNode : public Node {
 private:
@@ -27,7 +24,7 @@ private:
     SplitResult perform_internal_split_logic(uint32_t incoming_key, uint32_t incoming_child_id, InternalNode& sibling, Pager& pager);
 
 public:
-    InternalNode(Page *p, uint32_t id) : Node(p, id) {};
+    InternalNode(std::shared_ptr<Page> p, uint32_t id, Pager* pg = nullptr) : Node(p, id, pg) {};
 
     uint32_t get_leftmost_child();
 
@@ -35,7 +32,9 @@ public:
 
     uint32_t get_child_for_key(uint32_t key);
 
-    PageAwaiter initialize_as_root(uint32_t left_child_id, uint32_t split_key, uint32_t right_child_id);
+    uint32_t get_child_at(uint32_t index);
+
+    void initialize_as_root(uint32_t left_child_id, uint32_t split_key, uint32_t right_child_id);
 
     SplitResult split_and_insert_internal(uint32_t split_key, uint32_t new_page_id, Pager& pager);
     
@@ -61,7 +60,7 @@ public:
 
     bool is_root() const;
 
-    Page* get_page();
+    // Page* get_page();
     
 };
 
