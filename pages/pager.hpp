@@ -54,6 +54,7 @@ class Pager {
         // Memory-only test mode: no file, no io_uring; completions are simulated
         bool memory_only_ = false;
         std::vector<std::coroutine_handle<>> memory_pending_resumes_;
+        std::unique_ptr<HugepageAllocator> mem_pool;
 
     public:
         std::vector<uint8_t> dirty_bitmap;

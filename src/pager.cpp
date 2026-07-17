@@ -29,6 +29,10 @@ Pager::Pager(const std::string& filename, bool memory_only) : memory_only_(memor
         return;
     }
 
+    // Initialize a 512MB Buffer Pool backed by 256 HugePages (2MB each)
+    // This yields 131,072 individual 4KB DB Pages
+    mem_pool = std::make_unique<HugepageAllocator>(256);
+
     // Initialize io_uring
     if (io_uring_queue_init(256, &ring, 0) < 0) {
         throw std::runtime_error("Failed to initialize io_uring");
@@ -103,31 +107,71 @@ void Pager::pin_root(uint32_t root_id, std::shared_ptr<Page> existing_page) {
 }
 
 
+// std::shared_ptr<Page> Pager::get_page_shared(uint32_t page_id) {
+//     auto it = page_cache.find(page_id);
+
+//     // 1. If it's already in the cache, just return the pointer
+//     if (it != page_cache.end()) {
+//         return it->second;
+//     }
+
+//     // 2. Cache Miss: Perform a synchronous read
+//     // This is used during startup or specific sync operations
+//     auto page = std::make_shared<Page>();
+//     ssize_t bytes = pread(this->fd, page->data, PAGE_SIZE, (off_t)page_id * PAGE_SIZE);
+    
+//     if (bytes < 0) throw std::runtime_error("Sync read failed for page " + std::to_string(page_id));
+    
+//     // Ensure the rest of the page is clean if it's a partial read
+//     if (bytes < PAGE_SIZE) std::memset(page->data + bytes, 0, PAGE_SIZE - bytes);
+
+//     // 3. Save to cache and return
+//     page_cache[page_id] = page;
+//     return page;
+// }
+
+
 std::shared_ptr<Page> Pager::get_page_shared(uint32_t page_id) {
     auto it = page_cache.find(page_id);
 
-    // 1. If it's already in the cache, just return the pointer
+    // 1. Cache Hit: Just return the shared pointer
     if (it != page_cache.end()) {
         return it->second;
     }
 
-    // 2. Cache Miss: Perform a synchronous read
-    // This is used during startup or specific sync operations
-    auto page = std::make_shared<Page>();
-    ssize_t bytes = pread(this->fd, page->data, PAGE_SIZE, (off_t)page_id * PAGE_SIZE);
-    
-    if (bytes < 0) throw std::runtime_error("Sync read failed for page " + std::to_string(page_id));
-    
-    // Ensure the rest of the page is clean if it's a partial read
-    if (bytes < PAGE_SIZE) std::memset(page->data + bytes, 0, PAGE_SIZE - bytes);
+    // 2. Cache Miss: Request memory from our member Hugepage pool
+    if (!mem_pool) {
+        throw std::runtime_error("Hugepage pool (mem_pool) was not initialized!");
+    }
 
-    // 3. Save to cache and return
+    Page* raw_page = mem_pool->allocate();
+
+    // Wrap it in a std::shared_ptr with a custom deleter lambda that returns it to our allocator pool
+    std::shared_ptr<Page> page(raw_page, [this](Page* p) {
+        if (this->mem_pool) {
+            this->mem_pool->deallocate(p);
+        } else {
+            p->~Page();
+        }
+    });
+
+    // 3. Populate page data
+    if (memory_only_) {
+        std::memset(page->data, 0, PAGE_SIZE);
+    } else {
+
+        ssize_t bytes = pread(this->fd, page->data, PAGE_SIZE, (off_t)page_id * PAGE_SIZE);
+        
+        if (bytes < 0) throw std::runtime_error("Sync read failed for page " + std::to_string(page_id));
+        
+        // Ensure the rest of the page is clean if it's a partial read
+        if (bytes < PAGE_SIZE) std::memset(page->data + bytes, 0, PAGE_SIZE - bytes);
+    }
+
     page_cache[page_id] = page;
     return page;
+
 }
-
-
-
 
 
 void Pager::process_completions(bool wait) {
@@ -206,28 +250,83 @@ void Pager::schedule_write(uint32_t page_id, std::coroutine_handle<> h) {
     clear_dirty(page_id);
 }
 
+// void Pager::schedule_async_load(uint32_t page_id, std::coroutine_handle<> h) {
+//     // 1. Double-Check Cache (Safety first)
+//     if (page_cache.find(page_id) != page_cache.end()) {
+//         std::cout << "DEBUG: Page " << page_id << " landed in cache during suspension." << std::endl;
+//         h.resume(); 
+//         return;
+//     }
+
+//     auto page = std::make_shared<Page>();
+//     pending_io[page_id] = { OpType::READ, {h}, page };
+
+//     // Create a context wrapper for the Read operation
+//     // We use the single-handle constructor for IOContext
+//     IOContext* ctx = new IOContext(h, page_id, nullptr);
+
+//     struct io_uring_sqe* sqe = io_uring_get_sqe(&ring);
+//     io_uring_prep_read(sqe, fd, page->data, PAGE_SIZE, (off_t)page_id * PAGE_SIZE);
+    
+//     // Pass the pointer, not the ID
+//     io_uring_sqe_set_data(sqe, ctx); 
+//     io_uring_submit(&ring);
+// }
+
+
 void Pager::schedule_async_load(uint32_t page_id, std::coroutine_handle<> h) {
-    // 1. Double-Check Cache (Safety first)
     if (page_cache.find(page_id) != page_cache.end()) {
         std::cout << "DEBUG: Page " << page_id << " landed in cache during suspension." << std::endl;
-        h.resume(); 
+        h.resume();
         return;
     }
 
-    auto page = std::make_shared<Page>();
+    // 2. Allocate the page frame from your Hugepage pool
+    if (!mem_pool) {
+        throw std::runtime_error("Hugepage pool (mem_pool) was not initialized!");
+    }
+
+    Page* raw_page = mem_pool->allocate();
+
+    // Wrap in shared_ptr with your custom deleter to recycle memory automatically on release
+    std::shared_ptr<Page> page(raw_page, [this](Page* p) {
+        if (this->mem_pool) {
+            this->mem_pool->deallocate(p);
+        } else {
+            p->~Page();
+        }
+    });
+
+    // 3. Register the IORequest in pending_io map
     pending_io[page_id] = { OpType::READ, {h}, page };
 
-    // Create a context wrapper for the Read operation
-    // We use the single-handle constructor for IOContext
-    IOContext* ctx = new IOContext(h, page_id, nullptr);
+    // 4. Handle Mmeory-Only Mode vs Disk I/O
+    if (memory_only_) {
+        // Clear buffer memory instantly
+        std::memset(page->data, 0, PAGE_SIZE);
 
-    struct io_uring_sqe* sqe = io_uring_get_sqe(&ring);
-    io_uring_prep_read(sqe, fd, page->data, PAGE_SIZE, (off_t)page_id * PAGE_SIZE);
-    
-    // Pass the pointer, not the ID
-    io_uring_sqe_set_data(sqe, ctx); 
-    io_uring_submit(&ring);
+        // In memory-only mode, simulate immediate completion by pushing to the resume queue
+        memory_pending_resumes_.push_back(h);
+    } else {
+        // Disk Mode: Prepare an IOContext wrapper for the async read completion
+        IOContext* ctx = new IOContext(h, page_id, nullptr);
+
+        struct io_uring_sqe* sqe = io_uring_get_sqe(&ring);
+
+        if (!sqe) {
+            throw std::runtime_error("Failed to acquire io_uring submission queue entry (SQE)!");
+        }
+
+        // Setup async pread from file descriptor directly int our fast Hugepage memory
+        // Setup async pread from file descriptor directly into our fast Hugepage memory buffer
+        io_uring_prep_read(sqe, fd, page->data, PAGE_SIZE, (off_t)page_id * PAGE_SIZE);
+        
+        // Pass the allocated context pointer as user data to matching completions
+        io_uring_sqe_set_data(sqe, ctx); 
+        io_uring_submit(&ring);
+    }
 }
+
 
 // --- Synchronous Fallbacks & Metadata ---
 
@@ -247,24 +346,51 @@ void Pager::write_page(uint32_t page_id, const Page& page) {
 
 
 
+// std::shared_ptr<Page> Pager::read_page(uint32_t page_id) {
+//     // 1. Create the page
+//     auto page = std::make_shared<Page>();
+    
+//     // 2. Read directly into the shared memory
+//     ssize_t bytes = pread(this->fd, page->data, PAGE_SIZE, (off_t)page_id * PAGE_SIZE);
+    
+//     if (bytes < 0) throw std::runtime_error("Sync read failed");
+//     if (bytes < PAGE_SIZE) std::memset(page->data + bytes, 0, PAGE_SIZE - bytes);
+
+//     // 3. Store in cache
+//     page_cache[page_id] = page;
+
+//     // 4. Return the SHARED pointer. No copying!
+//     return page;
+// }
+
 std::shared_ptr<Page> Pager::read_page(uint32_t page_id) {
-    // 1. Create the page
-    auto page = std::make_shared<Page>();
+    if (!mem_pool) {
+        throw std::runtime_error("The mem_pool was not Initialized!");
+    }
+
+
+    Page* raw_page = mem_pool->allocate();
+
+    std::shared_ptr<Page> page(raw_page, [this](Page* p) {
+        if (this->mem_pool) {
+            this->mem_pool->deallocate(p);
+        } else {
+            p->~Page();
+        }
+    });
     
-    // 2. Read directly into the shared memory
+    // Read directly from disk
     ssize_t bytes = pread(this->fd, page->data, PAGE_SIZE, (off_t)page_id * PAGE_SIZE);
-    
+
     if (bytes < 0) throw std::runtime_error("Sync read failed");
     if (bytes < PAGE_SIZE) std::memset(page->data + bytes, 0, PAGE_SIZE - bytes);
 
-    // 3. Store in cache
+    // Store in cache
     page_cache[page_id] = page;
 
-    // 4. Return the SHARED pointer. No copying!
     return page;
+
 }
-
-
 
 // --- Awaiter Factories ---
 
@@ -323,6 +449,30 @@ bool Pager::is_ring_idle() {
     return memory_only_ ? true : (io_uring_sq_ready(&ring) == 0);
 }
 
+// uint32_t Pager::get_unused_page_number() {
+//     uint32_t new_id = num_pages;
+//     num_pages++;
+
+//     // 1. Physically stretch the file on disk
+//     if (this->fd != -1) {
+//         if (ftruncate(this->fd, (off_t)num_pages * PAGE_SIZE) == -1) {
+//             throw std::runtime_error("CRITICAL: Failed to extend database file! Check disk space.");
+//         }
+//     }
+
+//     // 2. SHORTCUT: Put a blank page in the cache immediately
+//     auto blank_page = std::make_shared<Page>();
+//     std::memset(blank_page->data, 0, PAGE_SIZE);
+    
+//     // By putting it in the cache now, get_page_async will find it 
+//     // in memory and won't trigger an io_uring disk read.
+//     page_cache[new_id] = blank_page;
+
+//     std::cout << "DEBUG: Allocated New Page " << new_id << " (Skipping Disk Read)" << std::endl;
+//     return new_id;
+// }
+
+
 uint32_t Pager::get_unused_page_number() {
     uint32_t new_id = num_pages;
     num_pages++;
@@ -334,16 +484,28 @@ uint32_t Pager::get_unused_page_number() {
         }
     }
 
-    // 2. SHORTCUT: Put a blank page in the cache immediately
-    auto blank_page = std::make_shared<Page>();
-    std::memset(blank_page->data, 0, PAGE_SIZE);
-    
-    // By putting it in the cache now, get_page_async will find it 
-    // in memory and won't trigger an io_uring disk read.
-    page_cache[new_id] = blank_page;
+    if (!mem_pool) {
+        throw std::runtime_error("The Hugepage pool (mem_pool) was not initialised!");
+    }
+
+    Page* raw_page = mem_pool->allocate();
+
+    std::shared_ptr<Page> page(raw_page, [this](Page* p) {
+        if (mem_pool) {
+            this->mem_pool->deallocate(p);
+        } else {
+            p->~Page();
+        }
+    });
+
+    std::memset(page->data, 0, PAGE_SIZE);
+
+    page_cache[new_id] = page;
 
     std::cout << "DEBUG: Allocated New Page " << new_id << " (Skipping Disk Read)" << std::endl;
+
     return new_id;
+
 }
 
 
@@ -414,18 +576,49 @@ void Pager::shutdown_gracefully() {
 }
 
 // 2. Implementation for async_load_from_disk()
+// void Pager::async_load_from_disk(uint32_t page_id) {
+//     if (page_cache.find(page_id) == page_cache.end()) {
+//         page_cache[page_id] = std::make_shared<Page>();
+//     }
+
+//     struct io_uring_sqe* sqe = io_uring_get_sqe(&ring);
+//     if (!sqe) return; 
+
+//     io_uring_prep_read(sqe, fd, page_cache[page_id]->data, PAGE_SIZE, (off_t)page_id * PAGE_SIZE);
+//     io_uring_sqe_set_data(sqe, (void*)(uintptr_t)page_id);
+//     io_uring_submit(&ring);
+// }
+
+
+// 2. Implementation for async_load_from_disk()
 void Pager::async_load_from_disk(uint32_t page_id) {
+
     if (page_cache.find(page_id) == page_cache.end()) {
-        page_cache[page_id] = std::make_shared<Page>();
+        if (!mem_pool) {
+            throw std::runtime_error("The Hugepage pool (mem_pool) was not initialized!");
+        }
+
+        Page* raw_page = mem_pool->allocate();
+
+        std::shared_ptr<Page> page(raw_page, [this](Page* p) {
+            if (mem_pool) {
+                this->mem_pool->deallocate(p);
+            } else {
+                p->~Page();
+            }
+        });
+
+        page_cache[page_id] = page;
     }
-
     struct io_uring_sqe* sqe = io_uring_get_sqe(&ring);
-    if (!sqe) return; 
+    if (!sqe) return;
 
-    io_uring_prep_read(sqe, fd, page_cache[page_id]->data, PAGE_SIZE, (off_t)page_id * PAGE_SIZE);
+    io_uring_prep_read(sqe, fd, page_cache[page_id]->data, PAGE_SIZE, (off_t) page_id * PAGE_SIZE);
     io_uring_sqe_set_data(sqe, (void*)(uintptr_t)page_id);
     io_uring_submit(&ring);
+    
 }
+
 
 MultiFlushAwaiter Pager::flush_all_dirty_async() {
     // If nothing to flush, the awaiter handles immediate resumption

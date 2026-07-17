@@ -43,7 +43,7 @@ void segfault_handler(int sig) {
 int main() {
     std::signal(SIGINT, signal_handler);
     signal(SIGSEGV, segfault_handler);
-    Table db("my_database");
+    Table db{"my_database"};
     
     std::atomic<int> rows_inserted{0};
     VoidTask task = run_batch_inserts(db, 1000, rows_inserted);
