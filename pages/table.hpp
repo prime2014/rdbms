@@ -1,6 +1,7 @@
 #ifndef TABLE_HPP
 #define TABLE_HPP
 
+#include <string_view>
 #include <string>
 #include <memory>
 #include "pager.hpp"
@@ -18,7 +19,7 @@ struct CursorTask;
 
 class Table {
     private:
-        std::string table_name;
+        std::string_view table_name;
         std::unique_ptr<Pager> pager;
         uint32_t root_page_id;
         std::atomic<bool> is_splitting{false};
@@ -26,8 +27,12 @@ class Table {
         std::unordered_map<uint32_t, std::vector<std::coroutine_handle<>>> split_latches;
     public:
 
-        Table(const std::string& name, bool memory_only = false) : table_name(name), wal("engine_debug.log") {
-            pager = std::make_unique<Pager>(name + ".db", memory_only);
+        Table(const std::string_view name, bool memory_only = false) : table_name(name), wal("engine_debug.log") {
+            std::string db_filename;
+            db_filename.reserve(name.size() + 3);
+            db_filename.append(name).append(".db");
+
+            pager = std::make_unique<Pager>(db_filename, memory_only);
 
             if (pager->get_num_pages() == 0) {
                 // 1. Allocate IDs
@@ -97,11 +102,11 @@ class Table {
 
         void validate_tree(uint32_t page_id, int depth);
         
-        PageTask insert_async(uint32_t key, const std::string value);
+        PageTask insert_async(uint32_t key, const std::string_view value);
 
         void update_parent(uint32_t parent_id, SplitResult result);
 
-        PageTask handle_split_node(uint32_t leaf_id, LeafNode& leaf, uint32_t key, const std::string& value);
+        PageTask handle_split_node(uint32_t leaf_id, LeafNode& leaf, uint32_t key, std::string_view value);
 
         CursorTask find_async(uint32_t key);
 

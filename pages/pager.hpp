@@ -48,7 +48,8 @@ class Pager {
 
         std::map<uint32_t, std::shared_ptr<Page>> page_cache;
         std::map<uint32_t, IORequest> pending_io;
-        std::set<uint32_t> dirty_pages;
+        std::vector<uint8_t> is_page_dirty; // Indexed directly by page_id
+        std::vector<uint32_t> dirty_page_list; // Dense packing array to iterate over for flushes
         const size_t BATCH_THRESHOLD = 16;
 
         // Memory-only test mode: no file, no io_uring; completions are simulated
@@ -82,11 +83,11 @@ class Pager {
         std::shared_ptr<Page> get_page_from_cache(uint32_t page_id);
 
         Page* get_page(uint32_t page_id);
-        void mark_dirty(uint32_t page_id);
 
         void schedule_write(uint32_t page_id, std::coroutine_handle<> h);
 
-        void submit_write(uint32_t page_id, std::shared_ptr<BatchContext> batch);
+        // Change this inside pager.hpp:
+        void submit_write(uint32_t page_id, BatchContext* batch);
 
         void shutdown_gracefully();
 
@@ -98,9 +99,15 @@ class Pager {
 
         void process_completions(bool wait);
 
+        bool is_page_cached(uint32_t page_id) const {
+            return page_cache.find(page_id) != page_cache.end();
+        }
+
         MultiFlushAwaiter flush_all_dirty_async();
 
         void mark_as_dirty(uint32_t page_id);
+
+        void mark_dirty(uint32_t page_id);
 
         FlushAwaiter flush_page_async(uint32_t page_id);
 

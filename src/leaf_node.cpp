@@ -7,6 +7,7 @@
 
 #include <vector>
 #include <cstring>
+#include <string_view>
 
 
 char* LeafNode::cell_address(uint32_t cell_num) {
@@ -14,15 +15,16 @@ char* LeafNode::cell_address(uint32_t cell_num) {
 }
 
 
-SplitTask LeafNode::split_and_insert_async(uint32_t key, const char* value, Pager& pager) {
+SplitTask LeafNode::split_and_insert_async(uint32_t key, std::string_view value, Pager& pager) {
     uint32_t new_page_id = pager.get_unused_page_number();
     std::shared_ptr<Page> new_page_handle = co_await pager.get_page_async(new_page_id);
     LeafNode new_leaf(new_page_handle, new_page_id);
 
     // 1. Perform the memory shuffle
+    // Adapt perform_memory_split to take std::string_view, or use value.data() if it requires a C-string
     uint32_t split_key = perform_memory_split(key, value, new_leaf);
 
-    // 2. Mark everything dirty (No co_await here!)
+    // 2. Mark everything dirty
     pager.mark_dirty(this->get_page_id());
     pager.mark_dirty(new_page_id);
 
@@ -37,7 +39,76 @@ uint32_t LeafNode::get_parent() {
 }
 
 
-uint32_t LeafNode::perform_memory_split(uint32_t key, const char* value, LeafNode& new_leaf) {
+// uint32_t LeafNode::perform_memory_split(uint32_t key, const char* value, LeafNode& new_leaf) {
+//     uint32_t total_keys = get_key_count();
+//     uint32_t insertion_idx = find_insertion_index(key);
+    
+//     uint32_t total_after = total_keys + 1;
+//     uint32_t left_count = total_after / 2;
+//     uint32_t right_count = total_after - left_count;
+
+//     // 1. Build virtual buffer using the STRUCT type
+//     // This handles all the "byte jumping" logic automatically
+//     std::vector<LeafCell> buffer(total_after);
+//     LeafCell* src_data = reinterpret_cast<LeafCell*>(page->data + sizeof(PageHeader));
+
+//     // 2. Copy data before the insertion point
+//     if (insertion_idx > 0) {
+//         std::memcpy(buffer.data(), src_data, insertion_idx * sizeof(LeafCell));
+//     }
+    
+//     // 3. Insert new record with precision
+//     buffer[insertion_idx].key = key;
+//     // Use strncpy to prevent buffer overflow if 'value' is too long
+//     std::memset(buffer[insertion_idx].value, 0, 32); // Clear first
+//     if (value) {
+//         std::strncpy(buffer[insertion_idx].value, value, 31);
+//     }
+
+//     // 4. Copy remainder
+//     if (insertion_idx < total_keys) {
+//         std::memcpy(&buffer[insertion_idx + 1], 
+//                     &src_data[insertion_idx], 
+//                     (total_keys - insertion_idx) * sizeof(LeafCell));
+//     }
+
+//     // 5. Initialize new leaf metadata
+//     new_leaf.set_node_type(NODE_LEAF);
+//     new_leaf.set_is_root(false);
+//     new_leaf.set_key_count(right_count);
+
+//     // 6. Sibling pointer and Parent handling
+//     new_leaf.set_next_page(this->get_next_page());
+//     this->set_next_page(new_leaf.get_page_id());
+    
+//     uint32_t current_parent = this->get_parent();
+//     this->set_parent(current_parent);
+//     new_leaf.set_parent(current_parent);
+
+//     // 7. Distribute the data back to the actual pages
+//     auto* left_layout = reinterpret_cast<LeafPageLayout*>(this->page->data);
+//     auto* right_layout = reinterpret_cast<LeafPageLayout*>(new_leaf.get_page()->data);
+
+//     // Current Page (Left)
+//     std::memcpy(left_layout->cells, 
+//                 buffer.data(), 
+//                 left_count * sizeof(LeafCell));
+//     left_layout->header.key_count = left_count;
+
+//     // New Sibling Page (Right)
+//     std::memcpy(right_layout->cells, 
+//                 buffer.data() + left_count, 
+//                 right_count * sizeof(LeafCell));
+//     right_layout->header.key_count = right_count;
+
+//     return buffer[left_count].key; // Smallest key in the right leaf
+// }
+
+
+#include <array>
+
+
+uint32_t LeafNode::perform_memory_split(uint32_t key, std::string_view value, LeafNode& new_leaf) {
     uint32_t total_keys = get_key_count();
     uint32_t insertion_idx = find_insertion_index(key);
     
@@ -45,9 +116,8 @@ uint32_t LeafNode::perform_memory_split(uint32_t key, const char* value, LeafNod
     uint32_t left_count = total_after / 2;
     uint32_t right_count = total_after - left_count;
 
-    // 1. Build virtual buffer using the STRUCT type
-    // This handles all the "byte jumping" logic automatically
-    std::vector<LeafCell> buffer(total_after);
+    // Sized to safely hold the overflow cell during execution.
+    std::array<LeafCell, LEAF_NODE_MAX_CELLS + 1> buffer;
     LeafCell* src_data = reinterpret_cast<LeafCell*>(page->data + sizeof(PageHeader));
 
     // 2. Copy data before the insertion point
@@ -57,10 +127,12 @@ uint32_t LeafNode::perform_memory_split(uint32_t key, const char* value, LeafNod
     
     // 3. Insert new record with precision
     buffer[insertion_idx].key = key;
-    // Use strncpy to prevent buffer overflow if 'value' is too long
-    std::memset(buffer[insertion_idx].value, 0, 32); // Clear first
-    if (value) {
-        std::strncpy(buffer[insertion_idx].value, value, 31);
+    std::memset(buffer[insertion_idx].value, 0, 32); 
+    
+    // 💡 FIX: Use std::memcpy bound by string_view's actual size up to 31 bytes
+    if (!value.empty()) {
+        size_t copy_len = std::min(value.size(), size_t(31));
+        std::memcpy(buffer[insertion_idx].value, value.data(), copy_len);
     }
 
     // 4. Copy remainder

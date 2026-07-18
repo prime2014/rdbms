@@ -4,6 +4,7 @@
 #include <cstdint>
 #include "page.hpp"
 #include "node.hpp"
+#include <string_view>
 
 class Pager;
 struct SplitTask;
@@ -21,7 +22,7 @@ class LeafNode: public Node {
 
         uint32_t get_key_at_index(uint32_t mid);
 
-        uint32_t perform_memory_split(uint32_t key, const char* value, LeafNode& new_leaf);
+        uint32_t perform_memory_split(uint32_t key, std::string_view value, LeafNode& new_leaf);
 
         uint32_t get_key(uint32_t cell_num);
 
@@ -39,7 +40,7 @@ class LeafNode: public Node {
 
         SplitResult insert(uint32_t key, const char* value, Pager& pager);
 
-        SplitTask split_and_insert_async(uint32_t key, const char* value, Pager& pager);
+        SplitTask split_and_insert_async(uint32_t key, std::string_view value, Pager& pager);
 
     
 };

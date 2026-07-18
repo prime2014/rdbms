@@ -20,88 +20,145 @@ std::shared_ptr<Page> PageAwaiter::await_resume() {
 }
 
 
-
 void FlushAwaiter::await_suspend(std::coroutine_handle<> h) {
     // 1. Create a BatchContext for this single operation
-    // The count is 1 because this awaiter is only waiting for one page.
     auto batch = std::make_shared<BatchContext>(h, 1);
 
-    // 2. Pass the shared_ptr to the pager
-    // This matches the new signature: void submit_write(uint32_t, shared_ptr<BatchContext>)
-    pager->submit_write(page_id, batch);
+    // 2. Pass the raw pointer using .get()
+    pager->submit_write(page_id, batch.get());
 }
 
 void FlushAwaiter::await_resume() { }
 
 // Example of defining the nested FinalAwaiter logic in the .cpp
-bool PageTask::promise_type::FinalAwaiter::await_ready() noexcept { 
-    return false; 
-}
+// bool PageTask::promise_type::FinalAwaiter::await_ready() noexcept { 
+//     return false; 
+// }
 
-std::coroutine_handle<> PageTask::promise_type::FinalAwaiter::await_suspend(std::coroutine_handle<promise_type> h) noexcept {
-    if (h.promise().continuation) return h.promise().continuation;
-    return std::noop_coroutine();
-}
+// std::coroutine_handle<> PageTask::promise_type::FinalAwaiter::await_suspend(std::coroutine_handle<promise_type> h) noexcept {
+//     if (h.promise().continuation) return h.promise().continuation;
+//     return std::noop_coroutine();
+// }
 
-void PageTask::promise_type::FinalAwaiter::await_resume() noexcept {}
+// void PageTask::promise_type::FinalAwaiter::await_resume() noexcept {}
 
 // Your existing definitions
-PageTask PageTask::promise_type::get_return_object() { 
-    return { std::coroutine_handle<promise_type>::from_promise(*this) }; 
-}
+// PageTask PageTask::promise_type::get_return_object() { 
+//     return { std::coroutine_handle<promise_type>::from_promise(*this) }; 
+// }
 
-std::suspend_never PageTask::promise_type::initial_suspend() { return {}; }
+// PageTask PageTask::promise_type::get_return_object() { 
+//     return PageTask{ std::coroutine_handle<promise_type>::from_promise(*this) }; 
+// }
 
-PageTask::promise_type::FinalAwaiter PageTask::promise_type::final_suspend() noexcept {
-    return {};
-}
+// std::suspend_never PageTask::promise_type::initial_suspend() { return {}; }
 
-void PageTask::promise_type::return_value(std::shared_ptr<Page> p) { result_page = std::move(p); }
+// std::suspend_always PageTask::promise_type::initial_suspend() { return {}; }
 
-void PageTask::promise_type::unhandled_exception() {
-    exception = std::current_exception();
-}
+// PageTask::promise_type::FinalAwaiter PageTask::promise_type::final_suspend() noexcept {
+//     return {};
+// }
+
+// void PageTask::promise_type::return_value(std::shared_ptr<Page> p) { result_page = std::move(p); }
+
+// void PageTask::promise_type::unhandled_exception() {
+//     exception = std::current_exception();
+// }
+
+
+// void MultiFlushAwaiter::await_suspend(std::coroutine_handle<> h) {
+//     awaiting_coroutine = h;
+//     allocated_pages.reserve(page_ids.size());
+
+//     for (size_t i = 0; i < page_ids.size(); ++i) {
+//         uint32_t page_id = page_ids[i];
+//         off_t offset = static_cast<off_t>(page_id) * PAGE_SIZE;
+
+//         // 1. Allocate a zero-TLB 4KB Page from your HugePage arena
+//         Page* huge_page = pager->mem_pool->allocate();
+//         allocated_pages.push_back(huge_page);
+
+//         //2. Snapshot dirty page cache directly into the HugeOage slot
+//         std::memcpy(huge_page->data, pager->page_cache[page_id]->data, PAGE_SIZE);
+
+//         struct io_uring_sqe* sqe = io_uring_get_sqe(&pager->ring);
+//         if (!sqe) {
+//             io_uring_submit(&pager->ring);
+//             sqe = io_uring_get_sqe(&pager->ring);
+//         }
+
+//         io_uring_prep_write_fixed(sqe, pager->fd, huge_page->data, PAGE_SIZE, offset, 0);
+//         io_uring_sqe_set_data(sqe, this);
+//     }
+
+//     io_uring_submit(&pager->ring);
+
+// }
 
 
 void MultiFlushAwaiter::await_suspend(std::coroutine_handle<> h) {
-    if (page_ids->empty()) {
-        h.resume();
-        return;
-    }
+    auto* ctx = new BatchContext(h, page_ids.size());
+    uintptr_t tagged_ptr = reinterpret_cast<uintptr_t>(ctx) | 1;
+    void* user_data_tag = reinterpret_cast<void*>(tagged_ptr);
 
-    // 1. Prepare the BatchContext
-    auto batch_ctx = std::make_shared<BatchContext>(h, 0); 
-    
-    // We move the counter value into the tethered context here
-    batch_ctx->counter.store(remaining->load()); 
-    batch_ctx->pages = *page_ids;
-    batch_ctx->resumed.store(false);
+    size_t pending_in_ring = 0;
+    size_t totally_submitted = 0;
 
-    // 2. Prepare all SQEs
-    for (uint32_t page_id : *page_ids) {
+    for (size_t i = 0; i < page_ids.size(); ++i) {
+        uint32_t page_id = page_ids[i];
         off_t offset = static_cast<off_t>(page_id) * PAGE_SIZE;
-        auto buffer_snapshot = std::make_unique<char[]>(PAGE_SIZE);
-        std::memcpy(buffer_snapshot.get(), pager->page_cache[page_id]->data, PAGE_SIZE);
 
-        // FIX: Remove 'remaining'. The constructor signature is:
-        // IOContext(shared_ptr<BatchContext>, uint32_t, unique_ptr<char[]>)
-        IOContext* ctx = new IOContext(batch_ctx, page_id, std::move(buffer_snapshot));
+        Page* huge_page = pager->mem_pool->allocate();
+        ctx->allocated_pages.push_back(huge_page);
+        std::memcpy(huge_page->data, pager->page_cache[page_id]->data, PAGE_SIZE);
 
         struct io_uring_sqe* sqe = io_uring_get_sqe(&pager->ring);
         if (!sqe) {
-            io_uring_submit(&pager->ring);
+            int ret = io_uring_submit(&pager->ring);
+            if (ret < 0) {
+                std::cerr << "[FATAL] Mid-batch submission failed: " << std::strerror(-ret) << std::endl;
+                
+                // Adjust our context counter so it reflects only what we successfully queued up before this crash
+                ctx->counter.store(totally_submitted, std::memory_order_release);
+                
+                // If nothing was ever submitted to the kernel, clean up right now safely
+                if (totally_submitted == 0) {
+                    for (Page* page : ctx->allocated_pages) pager->mem_pool->deallocate(page);
+                    delete ctx;
+                    h.resume();
+                    return;
+                }
+                // Otherwise, let the in-flight ones drain out naturally through process_completions!
+                return;
+            }
+            totally_submitted += pending_in_ring;
+            pending_in_ring = 0;
             sqe = io_uring_get_sqe(&pager->ring);
         }
-        
-        // Use the buffer inside the ctx to ensure memory stays valid for the kernel
-        io_uring_prep_write(sqe, pager->fd, ctx->write_buffer.get(), PAGE_SIZE, offset);
-        io_uring_sqe_set_data(sqe, ctx);
+
+        io_uring_prep_write_fixed(sqe, pager->fd, huge_page->data, PAGE_SIZE, offset, 0);
+        io_uring_sqe_set_data(sqe, user_data_tag);
+        pending_in_ring++;
     }
-    
-    io_uring_submit(&pager->ring);
+
+    // Capture the final submission result
+    int submitted = io_uring_submit(&pager->ring);
+    if (submitted < 0) {
+        std::cerr << "[FATAL] io_uring_submit failed: " << std::strerror(-submitted) << std::endl;
+        
+        ctx->counter.store(totally_submitted, std::memory_order_release);
+        
+        if (totally_submitted == 0) {
+            for (Page* page : ctx->allocated_pages) {
+                pager->mem_pool->deallocate(page);
+            }
+            delete ctx;
+            h.resume();
+        }
+    } else {
+        totally_submitted += pending_in_ring;
+    }
 }
-
-
 
 
 bool PageLatch::await_ready() {

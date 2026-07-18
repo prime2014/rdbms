@@ -140,24 +140,66 @@ uint32_t Table::find_leaf(uint32_t page_id, uint32_t key) {
 };
 
 
+// LeafSearchTask Table::find_leaf_async(uint32_t root_id, uint32_t key) {
+//     uint32_t current_id = root_id;
+//     auto page_handle = pager->get_page_shared(current_id);
+
+//     while (true) {
+//         Node node(page_handle, current_id);
+//         if (node.get_node_type() == NODE_LEAF) {
+//             // Pack both into the struct
+//             co_return FoundLeaf{ page_handle, current_id }; 
+//         }
+
+//         InternalNode internal(page_handle, current_id);
+//         current_id = internal.get_child_for_key(key);
+        
+//         // This still returns shared_ptr<Page>, which is fine!
+//         page_handle = co_await pager->get_page_async(current_id);
+//     }
+// }
+
+
+// LeafSearchTask Table::find_leaf_async(uint32_t root_id, uint32_t key) {
+//     uint32_t current_id = root_id;
+//     auto page_handle = pager->get_page_shared(current_id);
+
+//     while (true) {
+//         Node node(page_handle, current_id);
+//         if (node.get_node_type() == NODE_LEAF) {
+//             co_return FoundLeaf{ page_handle, current_id }; 
+//         }
+
+//         InternalNode internal(page_handle, current_id);
+//         current_id = internal.get_child_for_key(key);
+        
+//         // Clean, public API check!
+//         if (pager->is_page_cached(current_id)) {
+//             page_handle = pager->get_page_shared(current_id);
+//         } else {
+//             page_handle = co_await pager->get_page_async(current_id);
+//         }
+//     }
+// }
+
+
 LeafSearchTask Table::find_leaf_async(uint32_t root_id, uint32_t key) {
     uint32_t current_id = root_id;
-    auto page_handle = pager->get_page_shared(current_id);
+    std::shared_ptr<Page> page_handle;
 
     while (true) {
+        page_handle = co_await pager->get_page_async(current_id);
+        
         Node node(page_handle, current_id);
         if (node.get_node_type() == NODE_LEAF) {
-            // Pack both into the struct
             co_return FoundLeaf{ page_handle, current_id }; 
         }
 
         InternalNode internal(page_handle, current_id);
         current_id = internal.get_child_for_key(key);
-        
-        // This still returns shared_ptr<Page>, which is fine!
-        page_handle = co_await pager->get_page_async(current_id);
     }
 }
+
 
 void Table::increment_total_count() {
     auto root_page = pager->read_page(0);
@@ -165,7 +207,7 @@ void Table::increment_total_count() {
 
     PageHeader* meta_header = reinterpret_cast<PageHeader*>(meta_page->data);
     meta_header->total_count++;
-    pager->mark_as_dirty(0);
+    pager->mark_dirty(0);
 };
 
 
@@ -456,11 +498,12 @@ void Table::release_latch(uint32_t page_id) {
 
 
 // Table.cpp
-PageTask Table::handle_split_node(uint32_t leaf_id, LeafNode& leaf, uint32_t key, const std::string& value) {
+PageTask Table::handle_split_node(uint32_t leaf_id, LeafNode& leaf, uint32_t key, std::string_view value) {
     std::cout << "DEBUG: Node [Split]: Starting split on page " << leaf_id << std::endl;
 
     // 1. Perform the physical split (Memory Mutation Node)
-    SplitResult result = co_await leaf.split_and_insert_async(key, value.c_str(), *pager);
+    // Pass value.data() safely here if split_and_insert_async expects a const char*
+    SplitResult result = co_await leaf.split_and_insert_async(key, value.data(), *pager);
 
     // 2. Handle Parent/Root Adjustment (Structural Node)
     bool was_root_split = (leaf_id == this->root_page_id);
@@ -481,13 +524,12 @@ PageTask Table::handle_split_node(uint32_t leaf_id, LeafNode& leaf, uint32_t key
     }
 
     // 3. Finalize Memory (Re-discovery Node)
-    // This ensures the orchestrator has the correct updated leaf page
     FoundLeaf re_find = co_await find_leaf_async(this->root_page_id, key);
     
     co_return re_find.page;
 }
 
-PageTask Table::insert_async(uint32_t key, const std::string value) {
+PageTask Table::insert_async(uint32_t key, const std::string_view value) {
     std::cout << "[INSERT START] Key: " << key << " | Root: " << this->root_page_id << std::endl;
 
     // NODE 1: DISCOVERY
@@ -503,7 +545,7 @@ PageTask Table::insert_async(uint32_t key, const std::string value) {
         std::cout << "[DEBUG] Normal Insert: Page " << leaf_info.id << " has " 
                   << (int)leaf.get_key_count() << " cells. Adding key: " << key << std::endl;
         
-        leaf.insert(key, value.c_str(), *pager);
+        leaf.insert(key, value.data(), *pager);
         pager->mark_dirty(leaf_info.id);
         final_page = leaf_info.page;
     } else {

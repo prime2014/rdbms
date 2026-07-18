@@ -49,6 +49,9 @@ class HugepageAllocator {
 
             // Slice the pool into 4 KB Page chunks
             size_t total_4kb_pages = pool_size_ / PAGE_SIZE;
+
+            free_pages_.reserve(total_4kb_pages);
+
             char* current = static_cast<char*>(pool_start_);
             for (size_t i = 0; i < total_4kb_pages; ++i) {
                 free_pages_.push_back(reinterpret_cast<Page*>(current));
@@ -62,6 +65,9 @@ class HugepageAllocator {
                 munmap(pool_start_, pool_size_);
             }
         }
+
+        void* get_pool_start() const { return pool_start_; }
+        size_t get_pool_size() const { return pool_size_; }
 
         // Allocate a 4KB Page from the Hugepage pool
         Page* allocate() {
@@ -79,6 +85,18 @@ class HugepageAllocator {
         void deallocate(Page* page) {
             page->~Page();
             free_pages_.push_back(page);
+        }
+
+        int get_buffer_index(Page* page) const {
+            if (page < pool_start_ || reinterpret_cast<char*>(page) >= (static_cast<char*>(pool_start_) + pool_size_)) {
+                throw std::runtime_error("Pointer does not belong to this HugepageAllocator pool!");
+            }
+            
+            // Pointer arithmetic: distance in bytes divided by page size
+            char* page_ptr = reinterpret_cast<char*>(page);
+            char* base_ptr = static_cast<char*>(pool_start_);
+            
+            return static_cast<int>((page_ptr - base_ptr) / PAGE_SIZE);
         }
 };
 

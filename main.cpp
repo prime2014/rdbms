@@ -65,8 +65,6 @@ int main() {
             // Option A: Small sleep to prevent 100% CPU usage
             std::this_thread::sleep_for(std::chrono::microseconds(100));
             
-            // Option B: Only wait if we know we actually submitted SQEs
-            // db.get_pager()->process_completions(true); // Only use if you track pending count
         }
     }
     

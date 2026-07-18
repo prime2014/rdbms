@@ -22,20 +22,35 @@ struct InsertContext {
 
 
 Pager::Pager(const std::string& filename, bool memory_only) : memory_only_(memory_only) {
+    // 💡 FIX 1: Initialize the memory pool first! Memory-only mode STILL needs pages.
+    // 512MB Buffer Pool backed by 256 HugePages (2MB each) -> 131,072 individual 4KB DB Pages
+    mem_pool = std::make_unique<HugepageAllocator>(256);
+
     if (memory_only_) {
+        // 💡 FIX 2: Reserve capacity for the simulation loop vector to stop heap allocations
+        memory_pending_resumes_.reserve(4096); 
+        
         this->fd = -1;
         this->file_length = 0;
         this->num_pages = 0;
-        return;
+        return; // Safe to exit early now; the pool is ready for memory mutations
     }
-
-    // Initialize a 512MB Buffer Pool backed by 256 HugePages (2MB each)
-    // This yields 131,072 individual 4KB DB Pages
-    mem_pool = std::make_unique<HugepageAllocator>(256);
 
     // Initialize io_uring
     if (io_uring_queue_init(256, &ring, 0) < 0) {
         throw std::runtime_error("Failed to initialize io_uring");
+    }
+
+    // Register Block for Physical Disk Engine
+    struct iovec iov;
+    iov.iov_base = mem_pool->get_pool_start();
+    iov.iov_len  = mem_pool->get_pool_size();
+
+    // Register the entire hugepage arena under index 0
+    int ret = io_uring_register_buffers(&ring, &iov, 1);
+    if (ret < 0) {
+        throw std::runtime_error("Failed to register Hugepage buffer pool with io_uring: " 
+                                 + std::string(std::strerror(-ret)));
     }
 
     // Open file using low-level O_RDWR for io_uring compatibility
@@ -174,55 +189,130 @@ std::shared_ptr<Page> Pager::get_page_shared(uint32_t page_id) {
 }
 
 
+// void Pager::process_completions(bool wait) {
+//     struct io_uring_cqe* cqe;
+    
+//     // 1. Wait for at least one completion if requested
+//     if (wait) {
+//         int ret;
+//         // Standard io_uring wait loop to handle signal interruptions (EINTR)
+//         while ((ret = io_uring_wait_cqe(&ring, &cqe)) == -EINTR);
+//         if (ret < 0) return;
+//     }
+
+//     std::vector<std::coroutine_handle<>> tasks_to_resume;
+
+//     // 2. Peek through all available CQEs
+//     while (io_uring_peek_cqe(&ring, &cqe) == 0) {
+//         IOContext* ctx = reinterpret_cast<IOContext*>(io_uring_cqe_get_data(cqe));
+        
+//         if (ctx) {
+//             // 1. Handle READ Operations (Page Loading)
+//             if (pending_io.count(ctx->page_id)) {
+//                 auto& entry = pending_io[ctx->page_id];
+                
+//                 // Move the loaded data into the cache
+//                 page_cache[ctx->page_id] = entry.page_buffer;
+                
+//                 // Collect all handles waiting for this specific page
+//                 for (auto h : entry.waiters) {
+//                     tasks_to_resume.push_back(h);
+//                 }
+//                 pending_io.erase(ctx->page_id);
+//             } 
+//             // 2. Handle WRITE Operations (Flushing/Barriers)
+//             else if (ctx->batch) {
+//                 auto& batch = ctx->batch;
+//                 if (batch->counter.fetch_sub(1) == 1) {
+//                     bool expected = false;
+//                     if (batch->resumed.compare_exchange_strong(expected, true)) {
+//                         tasks_to_resume.push_back(batch->handle);
+//                     }
+//                 }
+//             }
+            
+//             delete ctx; 
+//         }
+//         io_uring_cqe_seen(&ring, cqe);
+//     }
+
+//     // 3. Resume the collected tasks outside the CQE loop
+//     for (auto h : tasks_to_resume) {
+//         h.resume();
+//     }
+// }
+
+
 void Pager::process_completions(bool wait) {
     struct io_uring_cqe* cqe;
-    
-    // 1. Wait for at least one completion if requested
+
     if (wait) {
-        int ret;
-        // Standard io_uring wait loop to handle signal interruptions (EINTR)
-        while ((ret = io_uring_wait_cqe(&ring, &cqe)) == -EINTR);
+        int ret; 
+        while((ret = io_uring_wait_cqe(&ring, &cqe)) == -EINTR);
         if (ret < 0) return;
     }
 
-    std::vector<std::coroutine_handle<>> tasks_to_resume;
+    std::vector<std::coroutine_handle<>> task_to_resume;
 
-    // 2. Peek through all available CQEs
-    while (io_uring_peek_cqe(&ring, &cqe) == 0) {
-        IOContext* ctx = reinterpret_cast<IOContext*>(io_uring_cqe_get_data(cqe));
-        
-        if (ctx) {
-            // 1. Handle READ Operations (Page Loading)
-            if (pending_io.count(ctx->page_id)) {
-                auto& entry = pending_io[ctx->page_id];
-                
-                // Move the loaded data into the cache
-                page_cache[ctx->page_id] = entry.page_buffer;
-                
-                // Collect all handles waiting for this specific page
-                for (auto h : entry.waiters) {
-                    tasks_to_resume.push_back(h);
-                }
-                pending_io.erase(ctx->page_id);
-            } 
-            // 2. Handle WRITE Operations (Flushing/Barriers)
-            else if (ctx->batch) {
-                auto& batch = ctx->batch;
-                if (batch->counter.fetch_sub(1) == 1) {
-                    bool expected = false;
-                    if (batch->resumed.compare_exchange_strong(expected, true)) {
-                        tasks_to_resume.push_back(batch->handle);
+    while(io_uring_peek_cqe(&ring, &cqe) == 0) {
+        if (cqe->res < 0) {
+            std::cerr << "[IO ERROR] CQE execution failed: " << std::strerror(-cqe->res) 
+                      << " (Code: " << cqe->res << ")" << std::endl;
+        }
+        uintptr_t raw_user_data = reinterpret_cast<uintptr_t>(io_uring_cqe_get_data(cqe));
+
+        if (raw_user_data) {
+            bool is_write_batch = (raw_user_data & 1) != 0;
+            bool is_single_write = (raw_user_data & 2) != 0;
+
+            if (is_write_batch) {
+                // Restore the true BatchContext address from the tagged pointer
+                BatchContext* ctx = reinterpret_cast<BatchContext*>(raw_user_data & ~1);
+
+                // Check atomic decrement boundaries safely
+                if (ctx->counter.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+                    // Release transient blocks to the page pool
+                    for (Page* page : ctx->allocated_pages) {
+                        mem_pool->deallocate(page); 
                     }
+                    task_to_resume.push_back(ctx->awaiting_coroutine);
+                    delete ctx; 
+                }
+            } 
+            else if (is_single_write) {
+                // ─── NEW CONDITION ───
+                // Strip out Bit 1 to isolate the real raw frame pointer address
+                void* clean_coro_address = reinterpret_cast<void*>(raw_user_data & ~2);
+                
+                // Reconstruct the authentic handle out of thin air
+                auto h = std::coroutine_handle<>::from_address(clean_coro_address);
+                if (h) {
+                    task_to_resume.push_back(h);
                 }
             }
-            
-            delete ctx; 
+            else {
+                // READ OPERATION (Unchanged and perfectly safe from collisions)
+                IOContext* read_ctx = reinterpret_cast<IOContext*>(raw_user_data);
+
+                if (pending_io.count(read_ctx->page_id)) {
+                    auto& entry = pending_io[read_ctx->page_id];
+                    page_cache[read_ctx->page_id] = entry.page_buffer;
+
+                    for (auto& h : entry.waiters) {
+                        task_to_resume.push_back(h);
+                    }
+
+                    pending_io.erase(read_ctx->page_id);
+                    delete read_ctx;
+                }
+            }
         }
+        
         io_uring_cqe_seen(&ring, cqe);
     }
 
-    // 3. Resume the collected tasks outside the CQE loop
-    for (auto h : tasks_to_resume) {
+    // Safely resume queued coroutines outside the peek loop boundaries
+    for (auto& h : task_to_resume) {
         h.resume();
     }
 }
@@ -309,7 +399,7 @@ void Pager::schedule_async_load(uint32_t page_id, std::coroutine_handle<> h) {
         memory_pending_resumes_.push_back(h);
     } else {
         // Disk Mode: Prepare an IOContext wrapper for the async read completion
-        IOContext* ctx = new IOContext(h, page_id, nullptr);
+        IOContext* read_ctx = new IOContext(page_id, h);
 
         struct io_uring_sqe* sqe = io_uring_get_sqe(&ring);
 
@@ -322,7 +412,7 @@ void Pager::schedule_async_load(uint32_t page_id, std::coroutine_handle<> h) {
         io_uring_prep_read(sqe, fd, page->data, PAGE_SIZE, (off_t)page_id * PAGE_SIZE);
         
         // Pass the allocated context pointer as user data to matching completions
-        io_uring_sqe_set_data(sqe, ctx); 
+        io_uring_sqe_set_data(sqe, read_ctx); 
         io_uring_submit(&ring);
     }
 }
@@ -417,7 +507,35 @@ Page* Pager::get_page(uint32_t page_id) {
 
 
 void Pager::mark_dirty(uint32_t page_id) {
-    dirty_pages.insert(page_id);
+    if (page_id >= is_page_dirty.size()) {
+        is_page_dirty.resize(page_id + 64, 0);
+    }
+    
+    if (!is_page_dirty[page_id]) {
+        is_page_dirty[page_id] = 1;
+        dirty_page_list.push_back(page_id); // Amortized array growth away from hot insert loop
+    }
+}
+
+void Pager::clear_dirty(uint32_t page_id) {
+    // 1. Boundary guard: If it's outside our tracking size, it's already clean
+    if (page_id >= is_page_dirty.size() || !is_page_dirty[page_id]) {
+        return;
+    }
+
+    // 2. Mark it clean in our fast-lookup flags
+    is_page_dirty[page_id] = 0;
+
+    // 3. Remove it from the dense tracking list
+    // Since order doesn't matter for the flush sequence, we use the "Erase-and-Swap" idiom.
+    // This avoids a costly O(N) shifting of elements in the vector!
+    auto it = std::find(dirty_page_list.begin(), dirty_page_list.end(), page_id);
+    if (it != dirty_page_list.end()) {
+        // Swap the target element with the very last element in the vector
+        std::iter_swap(it, dirty_page_list.end() - 1);
+        // Pop the last element off in O(1) time—zero allocations or shifts!
+        dirty_page_list.pop_back();
+    }
 }
 
 void Pager::mark_as_dirty(uint32_t page_id) {
@@ -426,10 +544,10 @@ void Pager::mark_as_dirty(uint32_t page_id) {
     dirty_bitmap[idx] |= (1 << (page_id % 8));
 }
 
-void Pager::clear_dirty(uint32_t page_id) {
-    uint32_t idx = page_id / 8;
-    if (idx < dirty_bitmap.size()) dirty_bitmap[idx] &= ~(1 << (page_id % 8));
-}
+// void Pager::clear_dirty(uint32_t page_id) {
+//     uint32_t idx = page_id / 8;
+//     if (idx < dirty_bitmap.size()) dirty_bitmap[idx] &= ~(1 << (page_id % 8));
+// }
 
 bool Pager::is_dirty(uint32_t page_id) const {
     uint32_t idx = page_id / 8;
@@ -519,23 +637,30 @@ void Pager::submit_to_kernel() {
 
 
 
-void Pager::submit_write(uint32_t page_id, 
-                         std::shared_ptr<BatchContext> batch) { 
-    
+void Pager::submit_write(uint32_t page_id, BatchContext* batch) { 
     off_t offset = static_cast<off_t>(page_id) * PAGE_SIZE;
 
-    // Snapshot the data to avoid race conditions if the page is modified during IO
+    // Snapshot data to isolate the buffer from concurrent pool mutations
     auto buffer_snapshot = std::make_unique<char[]>(PAGE_SIZE);
     std::memcpy(buffer_snapshot.get(), page_cache[page_id]->data, PAGE_SIZE);
 
     struct io_uring_sqe* sqe = io_uring_get_sqe(&ring);
-    if (!sqe) return; // Always check for ring fullness
+    if (!sqe) {
+        io_uring_submit(&ring);
+        sqe = io_uring_get_sqe(&ring);
+        if (!sqe) return; // Drop target cleanly if ring is absolutely full
+    }
 
-    io_uring_prep_write(sqe, fd, buffer_snapshot.get(), PAGE_SIZE, offset);
-    
-    // Now the arguments match: (shared_ptr<BatchContext>, uint32_t, unique_ptr<char[]>)
+    // Capture raw buffer reference before std::move invalidates it
+    char* raw_buffer = buffer_snapshot.get();
+
+    // Construct the context using Constructor B
     IOContext* ctx = new IOContext(batch, page_id, std::move(buffer_snapshot));
+
+    io_uring_prep_write(sqe, fd, raw_buffer, PAGE_SIZE, offset);
     
+    // Crucial: Since we are passing a normal IOContext pointer here, 
+    // do NOT tag bit 0 with '| 1'. Keep it clean so process_completions knows it's an IOContext*.
     io_uring_sqe_set_data(sqe, ctx);
 }
 
@@ -620,20 +745,42 @@ void Pager::async_load_from_disk(uint32_t page_id) {
 }
 
 
+// MultiFlushAwaiter Pager::flush_all_dirty_async() {
+//     // If nothing to flush, the awaiter handles immediate resumption
+//     if (dirty_pages.empty()) {
+//         return MultiFlushAwaiter{this, {}, nullptr, true}; 
+//     }
+
+//     // Capture the current dirty set
+//     std::vector<uint32_t> ids(dirty_pages.begin(), dirty_pages.end());
+//     dirty_pages.clear();
+
+//     // We pass the RAW size (or a shared_ptr to it) to the awaiter.
+//     // The Awaiter will be responsible for putting this into the 
+//     // BatchContext tether once it has the coroutine handle 'h'.
+//     auto counter = std::make_shared<std::atomic<size_t>>(ids.size());
+    
+//     return MultiFlushAwaiter{this, std::move(ids), counter};
+// }
+
 MultiFlushAwaiter Pager::flush_all_dirty_async() {
-    // If nothing to flush, the awaiter handles immediate resumption
-    if (dirty_pages.empty()) {
-        return MultiFlushAwaiter{this, {}, nullptr, true}; 
+    if (dirty_page_list.empty()) {
+        return MultiFlushAwaiter{this, std::vector<uint32_t>{}}; 
     }
 
-    // Capture the current dirty set
-    std::vector<uint32_t> ids(dirty_pages.begin(), dirty_pages.end());
-    dirty_pages.clear();
+    // 1. Reset all the quick lookup dirt flags back to clean
+    for (uint32_t page_id : dirty_page_list) {
+        if (page_id < is_page_dirty.size()) {
+            is_page_dirty[page_id] = 0;
+        }
+    }
 
-    // We pass the RAW size (or a shared_ptr to it) to the awaiter.
-    // The Awaiter will be responsible for putting this into the 
-    // BatchContext tether once it has the coroutine handle 'h'.
-    auto counter = std::make_shared<std::atomic<size_t>>(ids.size());
-    
-    return MultiFlushAwaiter{this, std::move(ids), counter};
+    // 2. Allocate an empty vector on the stack to swap with our live data.
+    // This moves the heap-allocated memory buffer out of the pager and into 'ids'
+    std::vector<uint32_t> ids;
+    std::swap(ids, dirty_page_list); 
+
+    // 3. 'dirty_page_list' is now empty but preserves its underlying capacity,
+    // meaning the NEXT inserts won't require a single heap allocation to grow it!
+    return MultiFlushAwaiter{this, std::move(ids)};
 }
