@@ -19,6 +19,19 @@ std::shared_ptr<Page> PageAwaiter::await_resume() {
     return pager->get_page_from_cache(page_id);
 }
 
+MultiFlushAwaiter::MultiFlushAwaiter(Pager* p, const std::vector<uint32_t>& ids)
+    : pager(p), page_ids(ids) {
+
+    // Take the pre-allocated capacity from the pager's scratchpad
+    std::swap(allocated_pages, pager->flush_scratch_vector);
+    allocated_pages.clear(); // Resets size to 0 but keeps the underlying capacity!
+    allocated_pages.reserve(page_ids.size());
+}
+
+MultiFlushAwaiter::~MultiFlushAwaiter() {
+    std::swap(pager->flush_scratch_vector, allocated_pages);
+}
+
 
 void FlushAwaiter::await_suspend(std::coroutine_handle<> h) {
     // 1. Create a BatchContext for this single operation
@@ -97,8 +110,13 @@ void FlushAwaiter::await_resume() { }
 
 
 void MultiFlushAwaiter::await_suspend(std::coroutine_handle<> h) {
-    auto* ctx = new BatchContext(h, page_ids.size());
-    uintptr_t tagged_ptr = reinterpret_cast<uintptr_t>(ctx) | 1;
+    this->awaiting_coroutine = h;
+    this->counter.store(page_ids.size(), std::memory_order_relaxed);
+
+    // FIX: This guarantees the push_back below won't allocate on the heap!
+    this->allocated_pages.reserve(page_ids.size()); 
+
+    uintptr_t tagged_ptr = reinterpret_cast<uintptr_t>(this) | 1;
     void* user_data_tag = reinterpret_cast<void*>(tagged_ptr);
 
     size_t pending_in_ring = 0;
@@ -109,7 +127,7 @@ void MultiFlushAwaiter::await_suspend(std::coroutine_handle<> h) {
         off_t offset = static_cast<off_t>(page_id) * PAGE_SIZE;
 
         Page* huge_page = pager->mem_pool->allocate();
-        ctx->allocated_pages.push_back(huge_page);
+        this->allocated_pages.push_back(huge_page); // Safe from allocation due to reserve()
         std::memcpy(huge_page->data, pager->page_cache[page_id]->data, PAGE_SIZE);
 
         struct io_uring_sqe* sqe = io_uring_get_sqe(&pager->ring);
@@ -118,17 +136,14 @@ void MultiFlushAwaiter::await_suspend(std::coroutine_handle<> h) {
             if (ret < 0) {
                 std::cerr << "[FATAL] Mid-batch submission failed: " << std::strerror(-ret) << std::endl;
                 
-                // Adjust our context counter so it reflects only what we successfully queued up before this crash
-                ctx->counter.store(totally_submitted, std::memory_order_release);
+                // Adjust counter to only expect what we managed to push to the ring
+                size_t failed_to_submit = page_ids.size() - totally_submitted;
+                size_t remaining = this->counter.fetch_sub(failed_to_submit, std::memory_order_acq_rel) - failed_to_submit;
                 
-                // If nothing was ever submitted to the kernel, clean up right now safely
-                if (totally_submitted == 0) {
-                    for (Page* page : ctx->allocated_pages) pager->mem_pool->deallocate(page);
-                    delete ctx;
+                if (remaining == 0) {
+                    for (Page* page : this->allocated_pages) pager->mem_pool->deallocate(page);
                     h.resume();
-                    return;
                 }
-                // Otherwise, let the in-flight ones drain out naturally through process_completions!
                 return;
             }
             totally_submitted += pending_in_ring;
@@ -141,25 +156,21 @@ void MultiFlushAwaiter::await_suspend(std::coroutine_handle<> h) {
         pending_in_ring++;
     }
 
-    // Capture the final submission result
     int submitted = io_uring_submit(&pager->ring);
     if (submitted < 0) {
         std::cerr << "[FATAL] io_uring_submit failed: " << std::strerror(-submitted) << std::endl;
         
-        ctx->counter.store(totally_submitted, std::memory_order_release);
+        size_t failed_to_submit = page_ids.size() - totally_submitted;
+        size_t remaining = this->counter.fetch_sub(failed_to_submit, std::memory_order_acq_rel) - failed_to_submit;
         
-        if (totally_submitted == 0) {
-            for (Page* page : ctx->allocated_pages) {
-                pager->mem_pool->deallocate(page);
-            }
-            delete ctx;
+        if (remaining == 0) {
+            for (Page* page : this->allocated_pages) pager->mem_pool->deallocate(page);
             h.resume();
         }
     } else {
         totally_submitted += pending_in_ring;
     }
 }
-
 
 bool PageLatch::await_ready() {
     // This now works because the compiler knows what 'table' can do

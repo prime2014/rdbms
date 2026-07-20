@@ -28,9 +28,10 @@ class Table {
     public:
 
         Table(const std::string_view name, bool memory_only = false) : table_name(name), wal("engine_debug.log") {
-            std::string db_filename;
-            db_filename.reserve(name.size() + 3);
-            db_filename.append(name).append(".db");
+            std::string db_filename = std::string(name) + ".db";
+
+            // Pass via std::move to allow Pager to steal the stack-allocated string structure
+            pager = std::make_unique<Pager>(std::move(db_filename), memory_only);
 
             pager = std::make_unique<Pager>(db_filename, memory_only);
 

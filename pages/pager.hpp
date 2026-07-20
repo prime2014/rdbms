@@ -36,7 +36,6 @@ struct BatchContext;
 class Pager {
     private:
         int fd;
-        std::fstream file_stream;
         uint32_t file_length;
         uint32_t num_pages;
         struct io_uring ring;
@@ -45,6 +44,11 @@ class Pager {
         std::shared_ptr<Page> root_cache;
         std::shared_ptr<Page> last_page_pin;
         uint32_t last_page_id = 0xFFFFFFFF; 
+
+        std::vector<std::coroutine_handle<>> ready_coroutines;
+        // 💡 NEW: A persistent buffer to hold the snapshot for the active flush batch
+        std::vector<uint32_t> flush_id_buffer;
+
 
         std::map<uint32_t, std::shared_ptr<Page>> page_cache;
         std::map<uint32_t, IORequest> pending_io;
@@ -59,6 +63,8 @@ class Pager {
 
     public:
         std::vector<uint8_t> dirty_bitmap;
+        std::vector<Page*> flush_scratch_vector;
+
         Pager(const std::string& filename, bool memory_only = false);
         ~Pager();
 

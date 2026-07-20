@@ -12,6 +12,9 @@
 #include <span>
 #include <new>
 #include "../pages/node.hpp"
+#include <atomic>
+#include <thread>
+
 
 // Forward declarations to avoid direct implementation/inline pollution
 class Cursor;
@@ -347,17 +350,33 @@ struct FlushAwaiter {
 };
 
 // Optimized to prevent heap allocation per-flush sequence via std::span
+
 struct MultiFlushAwaiter {
     Pager* pager;
-    std::vector<uint32_t> page_ids;
+    const std::vector<uint32_t>& page_ids;
+    std::coroutine_handle<> awaiting_coroutine;
+    
+    std::atomic<size_t> counter{0};
+    std::vector<Page*> allocated_pages; 
 
-    // Accept by value, then move into our member variable
-    MultiFlushAwaiter(Pager* p, std::vector<uint32_t> ids)
-        : pager(p), page_ids(std::move(ids)) {}
+    MultiFlushAwaiter(Pager* p, const std::vector<uint32_t>& ids);
+
+    ~MultiFlushAwaiter();
+
+    // Ensure we don't accidentally copy or move destructively
+    MultiFlushAwaiter(const MultiFlushAwaiter&) = delete;
+    MultiFlushAwaiter& operator=(const MultiFlushAwaiter&) = delete;
 
     bool await_ready() noexcept { return page_ids.empty(); }
     void await_suspend(std::coroutine_handle<> h);
-    void await_resume() noexcept {}
+    void await_resume() noexcept {
+        // Double check safeguard: Ensure everything actually hit home before releasing
+        while (counter.load(std::memory_order_acquire) > 0) {
+            // Tight spin or low latency yield fallback 
+            // This guarantees the object cannot be destroyed if a CQE is lagging
+            std::this_thread::yield(); 
+        }
+    }
 };
 
 struct PageLatch {

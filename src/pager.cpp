@@ -10,13 +10,13 @@
 #include "../pages/wal_debug.hpp"
 #include "../pages/context.hpp"
 
-
+const int MAX_PAGES = 1024;
 
 struct InsertContext {
     uint32_t key;
     std::string value;
     std::vector<uint32_t> affected_pages;
-    std::shared_ptr<BatchContext> batch_ctx; // The same latch we discussed
+    std::shared_ptr<BatchContext> batch_ctx; 
     bool is_complete = false;
 };
 
@@ -25,6 +25,11 @@ Pager::Pager(const std::string& filename, bool memory_only) : memory_only_(memor
     // 💡 FIX 1: Initialize the memory pool first! Memory-only mode STILL needs pages.
     // 512MB Buffer Pool backed by 256 HugePages (2MB each) -> 131,072 individual 4KB DB Pages
     mem_pool = std::make_unique<HugepageAllocator>(256);
+    ready_coroutines.reserve(256);
+
+    is_page_dirty.resize(MAX_PAGES, 0);
+    dirty_page_list.reserve(MAX_PAGES);
+    flush_id_buffer.reserve(MAX_PAGES);
 
     if (memory_only_) {
         // 💡 FIX 2: Reserve capacity for the simulation loop vector to stop heap allocations
@@ -252,7 +257,8 @@ void Pager::process_completions(bool wait) {
         if (ret < 0) return;
     }
 
-    std::vector<std::coroutine_handle<>> task_to_resume;
+    // Reset tracking container without losing its pre-allocated capacity
+    ready_coroutines.clear();
 
     while(io_uring_peek_cqe(&ring, &cqe) == 0) {
         if (cqe->res < 0) {
@@ -262,48 +268,45 @@ void Pager::process_completions(bool wait) {
         uintptr_t raw_user_data = reinterpret_cast<uintptr_t>(io_uring_cqe_get_data(cqe));
 
         if (raw_user_data) {
-            bool is_write_batch = (raw_user_data & 1) != 0;
-            bool is_single_write = (raw_user_data & 2) != 0;
+            uintptr_t tag = raw_user_data & 0x3;
 
-            if (is_write_batch) {
-                // Restore the true BatchContext address from the tagged pointer
-                BatchContext* ctx = reinterpret_cast<BatchContext*>(raw_user_data & ~1);
+            if (tag == 1) { // WRITE BATCH
+                auto* awaiter = reinterpret_cast<MultiFlushAwaiter*>(raw_user_data & ~0x3);
 
-                // Check atomic decrement boundaries safely
-                if (ctx->counter.fetch_sub(1, std::memory_order_acq_rel) == 1) {
-                    // Release transient blocks to the page pool
-                    for (Page* page : ctx->allocated_pages) {
+                if (awaiter->counter.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+                    for (Page* page : awaiter->allocated_pages) {
                         mem_pool->deallocate(page); 
                     }
-                    task_to_resume.push_back(ctx->awaiting_coroutine);
-                    delete ctx; 
-                }
-            } 
-            else if (is_single_write) {
-                // ─── NEW CONDITION ───
-                // Strip out Bit 1 to isolate the real raw frame pointer address
-                void* clean_coro_address = reinterpret_cast<void*>(raw_user_data & ~2);
-                
-                // Reconstruct the authentic handle out of thin air
-                auto h = std::coroutine_handle<>::from_address(clean_coro_address);
-                if (h) {
-                    task_to_resume.push_back(h);
+                    ready_coroutines.push_back(awaiter->awaiting_coroutine);
                 }
             }
-            else {
-                // READ OPERATION (Unchanged and perfectly safe from collisions)
-                IOContext* read_ctx = reinterpret_cast<IOContext*>(raw_user_data);
+            else if (tag == 2) { // SINGLE WRITE
+                void* clean_coro_address = reinterpret_cast<void*>(raw_user_data & ~0x3);
+                if (auto h = std::coroutine_handle<>::from_address(clean_coro_address)) {
+                    ready_coroutines.push_back(h);
+                }
+            }
+            else { // READ OPERATION (tag == 0)
+                auto* read_ctx = reinterpret_cast<IOContext*>(raw_user_data);
 
-                if (pending_io.count(read_ctx->page_id)) {
-                    auto& entry = pending_io[read_ctx->page_id];
+                // Safe single-pass map lookup
+                auto it = pending_io.find(read_ctx->page_id);
+                if (it != pending_io.end()) {
+                    auto& entry = it->second;
+                    
+                    // NOTE: Consider changing page_cache to a flat vector or 
+                    // pre-allocated flat hash map to avoid allocations here.
                     page_cache[read_ctx->page_id] = entry.page_buffer;
 
                     for (auto& h : entry.waiters) {
-                        task_to_resume.push_back(h);
+                        ready_coroutines.push_back(h);
                     }
 
-                    pending_io.erase(read_ctx->page_id);
-                    delete read_ctx;
+                    pending_io.erase(it);
+                    
+                    // Replace this down the road with an arena/pool deallocation 
+                    // to keep the read framework entirely allocation-free.
+                    delete read_ctx; 
                 }
             }
         }
@@ -311,9 +314,11 @@ void Pager::process_completions(bool wait) {
         io_uring_cqe_seen(&ring, cqe);
     }
 
-    // Safely resume queued coroutines outside the peek loop boundaries
-    for (auto& h : task_to_resume) {
-        h.resume();
+    // Safe sequential resumption pass with completely stable memory state
+    for (auto h : ready_coroutines) {
+        if (h) {
+            h.resume();
+        }
     }
 }
 
@@ -507,15 +512,31 @@ Page* Pager::get_page(uint32_t page_id) {
 
 
 void Pager::mark_dirty(uint32_t page_id) {
-    if (page_id >= is_page_dirty.size()) {
-        is_page_dirty.resize(page_id + 64, 0);
+    // 1. Defend against a page_id scaling past your initialized MAX_PAGES ceiling
+    if (__builtin_expect(page_id >= is_page_dirty.size(), 0)) {
+        size_t new_size = std::max<size_t>(page_id + 1, is_page_dirty.size() * 2);
+        is_page_dirty.resize(new_size, 0);
+        dirty_page_list.reserve(new_size);
     }
     
+    // 2. Defend against unexpected capacity clearing during nested coroutine resumptions
+    if (__builtin_expect(dirty_page_list.size() >= dirty_page_list.capacity(), 0)) {
+        size_t new_capacity = std::max<size_t>({
+            (size_t)4096, 
+            dirty_page_list.capacity() * 2, 
+            is_page_dirty.size()
+        });
+        dirty_page_list.reserve(new_capacity);
+    }
+    
+    // 3. O(1) execution path
     if (!is_page_dirty[page_id]) {
         is_page_dirty[page_id] = 1;
-        dirty_page_list.push_back(page_id); // Amortized array growth away from hot insert loop
+        dirty_page_list.push_back(page_id); 
     }
 }
+
+
 
 void Pager::clear_dirty(uint32_t page_id) {
     // 1. Boundary guard: If it's outside our tracking size, it's already clean
@@ -764,23 +785,27 @@ void Pager::async_load_from_disk(uint32_t page_id) {
 // }
 
 MultiFlushAwaiter Pager::flush_all_dirty_async() {
+    // 1. Reset our persistent snapshot buffer without losing its heap allocation
+    flush_id_buffer.clear();
+
     if (dirty_page_list.empty()) {
-        return MultiFlushAwaiter{this, std::vector<uint32_t>{}}; 
+        return MultiFlushAwaiter{this, flush_id_buffer}; 
     }
 
-    // 1. Reset all the quick lookup dirt flags back to clean
+    // 2. Reset clean lookups
     for (uint32_t page_id : dirty_page_list) {
-        if (page_id < is_page_dirty.size()) {
+        if (__builtin_expect(page_id < is_page_dirty.size(), 1)) {
             is_page_dirty[page_id] = 0;
         }
     }
 
-    // 2. Allocate an empty vector on the stack to swap with our live data.
-    // This moves the heap-allocated memory buffer out of the pager and into 'ids'
-    std::vector<uint32_t> ids;
-    std::swap(ids, dirty_page_list); 
+    // 3. Populate our persistent, pre-allocated engine buffer
+    // This uses the memory reserved in the constructor. Zero allocations!
+    flush_id_buffer.insert(flush_id_buffer.end(), dirty_page_list.begin(), dirty_page_list.end());
 
-    // 3. 'dirty_page_list' is now empty but preserves its underlying capacity,
-    // meaning the NEXT inserts won't require a single heap allocation to grow it!
-    return MultiFlushAwaiter{this, std::move(ids)};
+    // 4. Reset tracking list while maintaining its capacity
+    dirty_page_list.clear(); 
+
+    // 5. Pass a reference to the stable buffer inside the Pager
+    return MultiFlushAwaiter{this, flush_id_buffer};
 }

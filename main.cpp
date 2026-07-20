@@ -46,7 +46,7 @@ int main() {
     Table db{"my_database"};
     
     std::atomic<int> rows_inserted{0};
-    VoidTask task = run_batch_inserts(db, 1000, rows_inserted);
+    VoidTask task = run_batch_inserts(db, 4000, rows_inserted);
     
     // Initial start
     task.handle.resume();
