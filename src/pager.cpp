@@ -323,6 +323,9 @@ void Pager::process_completions(bool wait) {
 }
 
 
+
+
+
 void Pager::schedule_write(uint32_t page_id, std::coroutine_handle<> h) {
     if (memory_only_) {
         clear_dirty(page_id);
@@ -345,28 +348,6 @@ void Pager::schedule_write(uint32_t page_id, std::coroutine_handle<> h) {
     clear_dirty(page_id);
 }
 
-// void Pager::schedule_async_load(uint32_t page_id, std::coroutine_handle<> h) {
-//     // 1. Double-Check Cache (Safety first)
-//     if (page_cache.find(page_id) != page_cache.end()) {
-//         std::cout << "DEBUG: Page " << page_id << " landed in cache during suspension." << std::endl;
-//         h.resume(); 
-//         return;
-//     }
-
-//     auto page = std::make_shared<Page>();
-//     pending_io[page_id] = { OpType::READ, {h}, page };
-
-//     // Create a context wrapper for the Read operation
-//     // We use the single-handle constructor for IOContext
-//     IOContext* ctx = new IOContext(h, page_id, nullptr);
-
-//     struct io_uring_sqe* sqe = io_uring_get_sqe(&ring);
-//     io_uring_prep_read(sqe, fd, page->data, PAGE_SIZE, (off_t)page_id * PAGE_SIZE);
-    
-//     // Pass the pointer, not the ID
-//     io_uring_sqe_set_data(sqe, ctx); 
-//     io_uring_submit(&ring);
-// }
 
 
 void Pager::schedule_async_load(uint32_t page_id, std::coroutine_handle<> h) {
